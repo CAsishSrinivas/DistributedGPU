@@ -75,6 +75,10 @@ public:
     // Returns whether last frame was processed remotely or fell back to local
     [[nodiscard]] bool lastFrameWasRemote() const noexcept;
 
+    // Zero-overhead baseline bypass toggle
+    void setBypass(bool bypass) noexcept;
+    [[nodiscard]] bool isBypass() const noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;

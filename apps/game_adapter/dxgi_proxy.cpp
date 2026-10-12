@@ -145,6 +145,7 @@ bool                                   g_workerConnected = false;
 static std::unique_ptr<dgpu::networking::WinsockInit> g_winsock;
 
 bool g_enableWriteback   = false;
+bool g_bypassOffload      = false; // Zero-overhead native rendering bypass
 uint32_t g_downsampleFactor = 4; // Default 4x downsample (480x270 at 1080p, 518 KB payload)
 
 // Resolves Worker Endpoint & Transport configuration from dgpu.ini, env, or registry
@@ -164,6 +165,9 @@ dgpu::networking::EndpointConfig resolveEndpointConfig() {
             if (line.find("writeback=1") != std::string::npos) {
                 g_enableWriteback = true;
                 logMsg("[dgpu_dxgi] Writeback enabled from dgpu.ini");
+            } else if (line.find("bypass=1") != std::string::npos || line.find("offload=0") != std::string::npos || line.find("enable_offload=0") != std::string::npos) {
+                g_bypassOffload = true;
+                logMsg("[dgpu_dxgi] Bypass mode active from dgpu.ini (zero-overhead native rendering)");
             } else if (line.find("scale=2") != std::string::npos) {
                 g_downsampleFactor = 2;
                 logMsg("[dgpu_dxgi] Scale set to 2x (960x540) from dgpu.ini");
@@ -512,6 +516,13 @@ void initDistributedHook(IDXGISwapChain* swapChain) {
 
     auto endpoint = resolveEndpointConfig();
 
+    if (g_bypassOffload) {
+        g_adapter.setBypass(true);
+        g_hookInitialized = true;
+        logMsg("[dgpu_dxgi] Native bypass active: offloading disabled for zero-overhead baseline.");
+        return;
+    }
+
     logMsg("[dgpu_dxgi] Connecting to Distributed GPU worker (" +
            std::string(dgpu::networking::transportTypeToString(endpoint.transport)) + ") at " +
            endpoint.host + ":" + std::to_string(endpoint.port) + "...");
@@ -548,7 +559,7 @@ void initDistributedHook(IDXGISwapChain* swapChain) {
 
 // ─── Asynchronous D3D12 Capture & Pipelined Composition ──────────────────────
 void processPipelinedFrame(IDXGISwapChain* pSwapChain) {
-    if (!g_hookInitialized) return;
+    if (!g_hookInitialized || g_bypassOffload) return;
 
     // 1. Query active backbuffer
     ComPtr<IDXGISwapChain3> sc3;
@@ -773,9 +784,8 @@ void processPipelinedFrame(IDXGISwapChain* pSwapChain) {
         } else {
             auto now = std::chrono::steady_clock::now();
             auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - front.submitTime).count();
-            if (elapsedMs > 3000) {
-                logMsg("[dgpu_dxgi] WARNING: In-flight task timed out (" + std::to_string(elapsedMs) + "ms); resetting connection.");
-                g_workerClient.disconnect();
+            if (elapsedMs > 250) {
+                logMsg("[dgpu_dxgi] WARNING: In-flight task exceeded frame deadline (" + std::to_string(elapsedMs) + "ms); dropping stale frame.");
                 g_inFlightQueue.pop_front();
             }
             break;
