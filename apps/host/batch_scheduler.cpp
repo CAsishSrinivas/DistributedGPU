@@ -2,7 +2,9 @@
 // Advanced batch scheduling system implementation.
 
 #include "batch_scheduler.hpp"
+
 #include "frame_compositor.hpp"
+#include "work_distributor.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -22,9 +24,8 @@ static double computePercentile(std::vector<double> v, double p) {
     return v[idx];
 }
 
-BatchRunMetrics AdvancedBatchScheduler::runHostOnly(
-    const std::vector<protocol::TaskRequest>& tasks,
-    LocalExecFn localExec) {
+BatchRunMetrics AdvancedBatchScheduler::runHostOnly(const std::vector<protocol::TaskRequest>& tasks,
+                                                    LocalExecFn localExec) {
 
     BatchRunMetrics m;
     m.modeName = "Host RTX 3050 Alone";
@@ -71,14 +72,11 @@ BatchRunMetrics AdvancedBatchScheduler::runHostOnly(
     return m;
 }
 
-BatchRunMetrics AdvancedBatchScheduler::runStaticSplit(
-    const std::vector<protocol::TaskRequest>& tasks,
-    uint32_t hostTaskCount,
-    LocalExecFn localExec,
-    RemoteExecFn remoteExec,
-    bool remoteAvailable,
-    double referenceHostThroughput,
-    const std::vector<protocol::TaskResult>& referenceResults) {
+BatchRunMetrics AdvancedBatchScheduler::runStaticSplit(const std::vector<protocol::TaskRequest>& tasks,
+                                                       uint32_t hostTaskCount, LocalExecFn localExec,
+                                                       RemoteExecFn remoteExec, bool remoteAvailable,
+                                                       double referenceHostThroughput,
+                                                       const std::vector<protocol::TaskResult>& referenceResults) {
 
     uint32_t n = static_cast<uint32_t>(tasks.size());
     hostTaskCount = std::min(hostTaskCount, n);
@@ -152,9 +150,7 @@ BatchRunMetrics AdvancedBatchScheduler::runStaticSplit(
     auto batchEnd = std::chrono::steady_clock::now();
     m.totalWallClockMs = std::chrono::duration<double, std::milli>(batchEnd - batchStart).count();
     m.throughputTasksPerSec = (n * 1000.0) / (m.totalWallClockMs > 0 ? m.totalWallClockMs : 1.0);
-    m.speedupVsHostAlone = (referenceHostThroughput > 0.0)
-                               ? (m.throughputTasksPerSec / referenceHostThroughput)
-                               : 1.0;
+    m.speedupVsHostAlone = (referenceHostThroughput > 0.0) ? (m.throughputTasksPerSec / referenceHostThroughput) : 1.0;
 
     m.p50LatencyMs = computePercentile(latencies, 0.50);
     m.p90LatencyMs = computePercentile(latencies, 0.90);
@@ -175,12 +171,8 @@ BatchRunMetrics AdvancedBatchScheduler::runStaticSplit(
 }
 
 BatchRunMetrics AdvancedBatchScheduler::runDynamicWorkStealing(
-    const std::vector<protocol::TaskRequest>& tasks,
-    LocalExecFn localExec,
-    RemoteExecFn remoteExec,
-    bool remoteAvailable,
-    double referenceHostThroughput,
-    const std::vector<protocol::TaskResult>& referenceResults) {
+    const std::vector<protocol::TaskRequest>& tasks, LocalExecFn localExec, RemoteExecFn remoteExec,
+    bool remoteAvailable, double referenceHostThroughput, const std::vector<protocol::TaskResult>& referenceResults) {
 
     uint32_t n = static_cast<uint32_t>(tasks.size());
     BatchRunMetrics m;
@@ -263,9 +255,7 @@ BatchRunMetrics AdvancedBatchScheduler::runDynamicWorkStealing(
     m.hostTasksExecuted = hostProcessed.load();
     m.workerTasksExecuted = workerProcessed.load();
     m.failedTasks = failures.load();
-    m.speedupVsHostAlone = (referenceHostThroughput > 0.0)
-                               ? (m.throughputTasksPerSec / referenceHostThroughput)
-                               : 1.0;
+    m.speedupVsHostAlone = (referenceHostThroughput > 0.0) ? (m.throughputTasksPerSec / referenceHostThroughput) : 1.0;
 
     m.p50LatencyMs = computePercentile(latencies, 0.50);
     m.p90LatencyMs = computePercentile(latencies, 0.90);
@@ -278,6 +268,66 @@ BatchRunMetrics AdvancedBatchScheduler::runDynamicWorkStealing(
     for (const auto& td : m.taskDetails) sumWait += td.queueWaitMs;
     m.meanQueueWaitMs = sumWait / n;
 
+    return m;
+}
+
+BatchRunMetrics AdvancedBatchScheduler::runAdaptiveWorkStealing(
+    const std::vector<protocol::TaskRequest>& tasks, LocalExecFn localExec, RemoteExecFn remoteExec,
+    bool remoteAvailable, const std::optional<protocol::WorkerCapabilities>& workerCaps, uint64_t linkBandwidthBps,
+    uint64_t baseRttUs, double referenceHostThroughput, const std::vector<protocol::TaskResult>& referenceResults) {
+
+    uint32_t n = static_cast<uint32_t>(tasks.size());
+    BatchRunMetrics m;
+    m.modeName = "Dynamic Work-Stealing Load Balancer";
+    m.totalTasks = n;
+    m.taskDetails.resize(n);
+
+    DynamicWorkDistributor distributor;
+    if (workerCaps.has_value()) {
+        distributor.setWorkerCapabilities(*workerCaps);
+    }
+    distributor.setLinkBandwidthBps(linkBandwidthBps);
+    distributor.setBaseRttUs(baseRttUs);
+
+    std::vector<protocol::TaskResult> results;
+    auto distMetrics = distributor.executeBatch(tasks, localExec, remoteExec, remoteAvailable, &results);
+
+    m.totalWallClockMs = distMetrics.totalWallClockMs;
+    m.throughputTasksPerSec = distMetrics.throughputTasksPerSec;
+    m.hostTasksExecuted = distMetrics.hostTasksExecuted;
+    m.workerTasksExecuted = distMetrics.workerTasksExecuted;
+    m.tasksStolenByHost = distMetrics.tasksStolenByHost;
+    m.tasksStolenByWorker = distMetrics.tasksStolenByWorker;
+    m.tinyTasksRetainedLocally = distMetrics.tinyTasksRetainedLocally;
+    m.failedTasks = distMetrics.failedTasks;
+    m.speedupVsHostAlone = (referenceHostThroughput > 0.0) ? (m.throughputTasksPerSec / referenceHostThroughput) : 1.0;
+
+    std::vector<double> latencies;
+    latencies.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        double taskMs = static_cast<double>(results[i].totalUs > 0 ? results[i].totalUs : results[i].gpuUs) / 1000.0;
+        latencies.push_back(taskMs);
+        m.taskDetails[i].taskId = tasks[i].taskId;
+        m.taskDetails[i].executedOn = (i < distMetrics.hostTasksExecuted) ? "Host (RTX 3050)" : "Worker (GTX 1650 Ti)";
+        m.taskDetails[i].gpuExecutionMs = static_cast<double>(results[i].gpuUs) / 1000.0;
+        m.taskDetails[i].totalTurnaroundMs = taskMs;
+        m.taskDetails[i].success = (results[i].status == protocol::TaskStatus::Ok);
+    }
+
+    m.p50LatencyMs = computePercentile(latencies, 0.50);
+    m.p90LatencyMs = computePercentile(latencies, 0.90);
+    m.p95LatencyMs = computePercentile(latencies, 0.95);
+    m.p99LatencyMs = computePercentile(latencies, 0.99);
+    m.maxLatencyMs = latencies.empty() ? 0.0 : *std::max_element(latencies.begin(), latencies.end());
+
+    if (referenceResults.size() == n) {
+        double totalMAE = 0.0;
+        for (uint32_t i = 0; i < n; ++i) {
+            totalMAE += FrameCompositor::computeMAE(referenceResults[i].output, results[i].output);
+        }
+        m.maeVsReference = totalMAE / n;
+    }
+
     if (referenceResults.size() == n) {
         double totalMAE = 0.0;
         for (uint32_t i = 0; i < n; ++i) {
@@ -289,12 +339,9 @@ BatchRunMetrics AdvancedBatchScheduler::runDynamicWorkStealing(
     return m;
 }
 
-std::vector<SweepPointResult> AdvancedBatchScheduler::runAllocationSweep(
-    const std::vector<protocol::TaskRequest>& tasks,
-    LocalExecFn localExec,
-    RemoteExecFn remoteExec,
-    bool remoteAvailable,
-    uint32_t step) {
+std::vector<SweepPointResult>
+AdvancedBatchScheduler::runAllocationSweep(const std::vector<protocol::TaskRequest>& tasks, LocalExecFn localExec,
+                                           RemoteExecFn remoteExec, bool remoteAvailable, uint32_t step) {
 
     uint32_t n = static_cast<uint32_t>(tasks.size());
     std::vector<SweepPointResult> sweep;
@@ -348,9 +395,10 @@ void AdvancedBatchScheduler::printSweepTable(const std::vector<SweepPointResult>
 }
 
 void AdvancedBatchScheduler::printMetricsSummary(const BatchRunMetrics& m) {
-    std::cout << std::format("  │ {:<28} │ {:>8.2f} ms │ {:>8.1f} t/s │ {:>6.2f}x │ {:>7.2f} ms │ {:>7.2f} ms │ {:>7.2f} ms │\n",
-                             m.modeName.substr(0, 28), m.totalWallClockMs, m.throughputTasksPerSec,
-                             m.speedupVsHostAlone, m.p50LatencyMs, m.p95LatencyMs, m.maxLatencyMs);
+    std::cout << std::format(
+        "  │ {:<28} │ {:>8.2f} ms │ {:>8.1f} t/s │ {:>6.2f}x │ {:>7.2f} ms │ {:>7.2f} ms │ {:>7.2f} ms │\n",
+        m.modeName.substr(0, 28), m.totalWallClockMs, m.throughputTasksPerSec, m.speedupVsHostAlone, m.p50LatencyMs,
+        m.p95LatencyMs, m.maxLatencyMs);
 }
 
 } // namespace dgpu::host
