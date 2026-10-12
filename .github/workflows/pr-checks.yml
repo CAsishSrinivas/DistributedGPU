@@ -1,0 +1,107 @@
+name: Pull Request Verification
+
+on:
+  pull_request:
+    branches: [ "develop", "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─── 1. C++ Build & CTest Regression Suite ──────────────────────────────────
+  cpp-build-and-test:
+    name: C++ MSVC Build & CTest (Windows x64)
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Configure CMake
+      run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+    - name: Build all targets (Release)
+      run: cmake --build build --config Release --parallel
+
+    - name: Run CTest test suite
+      run: ctest --test-dir build -C Release --output-on-failure
+
+  # ─── 2. HLSL Shader Offline Compilation & Validation ─────────────────────────
+  hlsl-shader-validation:
+    name: HLSL Shader Validation (DXC)
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Compile & Validate HLSL Compute Shaders
+      shell: pwsh
+      run: |
+        $dxcPath = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\dxc.exe" -ErrorAction SilentlyContinue | Select-Object -Last 1).FullName
+        if (-not $dxcPath) {
+          throw "DirectX Shader Compiler (dxc.exe) not found in Windows SDK!"
+        }
+        Write-Host "Using DXC: $dxcPath" -ForegroundColor Cyan
+
+        $shaders = @(
+          @{ Path = "shaders/blur.hlsl"; Profile = "cs_6_0"; Entry = "CSMain" },
+          @{ Path = "shaders/edge_detect.hlsl"; Profile = "cs_6_0"; Entry = "CSMain" }
+        )
+
+        foreach ($s in $shaders) {
+          Write-Host "Validating $($s.Path) [$($s.Profile):$($s.Entry)]..." -ForegroundColor Yellow
+          & $dxcPath -T $s.Profile -E $s.Entry -Werror $s.Path
+          if ($LASTEXITCODE -ne 0) {
+            throw "Shader validation failed for $($s.Path)"
+          }
+          Write-Host "  -> PASSED" -ForegroundColor Green
+        }
+
+  # ─── 3. PowerShell Script Quality & Analysis ────────────────────────────────
+  powershell-analysis:
+    name: PowerShell Script Analysis (PSScriptAnalyzer)
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Run PSScriptAnalyzer
+      shell: pwsh
+      run: |
+        if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+        }
+        $results = Invoke-ScriptAnalyzer -Path ./scripts -Severity Error,Warning -Recurse
+        if ($results) {
+          $results | Format-Table -AutoSize
+          $errors = $results | Where-Object { $_.Severity -eq "Error" }
+          if ($errors) {
+            throw "PSScriptAnalyzer encountered errors in scripts!"
+          }
+        } else {
+          Write-Host "PSScriptAnalyzer: All PowerShell scripts passed cleanly." -ForegroundColor Green
+        }
+
+  # ─── 4. Code Quality & Formatting Check ─────────────────────────────────────
+  code-formatting:
+    name: Clang-Format Code Style Check
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install clang-format
+      run: sudo apt-get update && sudo apt-get install -y clang-format
+
+    - name: Check C++ code formatting
+      run: |
+        find apps libs tests -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.h" \) -exec clang-format --dry-run --Werror {} +
+      continue-on-error: true # Non-blocking advisory check for formatting
