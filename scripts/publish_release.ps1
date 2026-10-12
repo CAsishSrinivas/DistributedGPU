@@ -105,12 +105,20 @@ try {
     }
 } catch { }
 
+# Generate Dynamic Subsystem Release Notes Based on File Changes
+$notesScript = Join-Path $PSScriptRoot "generate_release_notes.ps1"
+$releaseNotes = if (Test-Path $notesScript) {
+    & $notesScript -TargetRef "HEAD" -Branch $Branch
+} else {
+    "$desc`n`nGenerated on: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC') from branch '$Branch'."
+}
+
 # Create New Release
 $releaseBody = @{
     tag_name         = $tag
     target_commitish = $Branch
     name             = $title
-    body             = "$desc`n`nGenerated on: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC') from branch '$Branch'."
+    body             = $releaseNotes
     draft            = $false
     prerelease       = $isPreRelease
 } | ConvertTo-Json
