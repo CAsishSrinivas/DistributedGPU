@@ -1,5 +1,6 @@
 add_library(dgpu_networking STATIC
     src/tcp_connection.cpp
+    src/health_monitor.cpp
 )
 target_include_directories(dgpu_networking PUBLIC include)
 target_link_libraries(dgpu_networking

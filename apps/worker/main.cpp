@@ -5,6 +5,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <objbase.h>
 
 #include "networking/tcp_connection.hpp"
 #include "protocol/message.hpp"
@@ -15,6 +16,7 @@
 #include <atomic>
 #include <csignal>
 #include <cstdint>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
@@ -25,9 +27,43 @@
 static constexpr uint16_t    WORKER_PORT      = 7777;
 static constexpr const char* PREFERRED_ADAPTER = "GTX 1650";  // substring match
 
-// ─── Global shutdown flag ─────────────────────────────────────────────────────
+// ─── Global state ─────────────────────────────────────────────────────────────
 
-static std::atomic_bool g_running{true};
+static std::atomic_bool                   g_running{true};
+static dgpu::protocol::WorkerCapabilities s_workerCaps;
+
+// ─── Stable Worker UUID ───────────────────────────────────────────────────────
+
+static std::string getOrCreateWorkerId() {
+    const std::filesystem::path idPath = "worker_id.txt";
+    if (std::filesystem::exists(idPath)) {
+        std::ifstream f(idPath);
+        std::string id;
+        if (f >> id && !id.empty()) {
+            return id;
+        }
+    }
+
+    GUID guid{};
+    std::string newId;
+    if (SUCCEEDED(CoCreateGuid(&guid))) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf),
+            "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            guid.Data1, guid.Data2, guid.Data3,
+            guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3],
+            guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+        newId = buf;
+    } else {
+        newId = "00000000-0000-0000-0000-000000000001";
+    }
+
+    std::ofstream out(idPath);
+    if (out.is_open()) {
+        out << newId;
+    }
+    return newId;
+}
 
 static void handleSignal(int) {
     std::cout << "\n[worker] Shutdown requested.\n";
@@ -52,7 +88,8 @@ static void handleConnection(dgpu::networking::TcpConnection conn,
     uint16_t version = _byteswap_ushort(hello.header.version);
     uint16_t msgType = _byteswap_ushort(hello.header.messageType);
 
-    if (magic != MAGIC || version != PROTO_VERSION ||
+    if (magic != MAGIC ||
+        (version != PROTO_VERSION && version != PROTO_VERSION_V1) ||
         msgType != static_cast<uint16_t>(MessageType::Hello)) {
         std::cerr << "[worker] Handshake rejected: invalid header from " << conn.peerAddress()
                   << " (magic=0x" << std::hex << magic << " type=0x" << msgType << std::dec << ")\n";
@@ -78,8 +115,8 @@ static void handleConnection(dgpu::networking::TcpConnection conn,
               << " (" << (hostInfo.gpuName.empty() ? "GPU unspecified" : hostInfo.gpuName) << ")\n";
 
     const auto& adapter = executor.adapterInfo();
-    Message ack = Message::makeHelloAck("WorkerB", adapter.name,
-                                        static_cast<uint32_t>(adapter.dedicatedVideoMemoryBytes / (1024 * 1024)));
+    uint32_t vramMb = static_cast<uint32_t>(adapter.dedicatedVideoMemoryBytes / (1024 * 1024));
+    Message ack = Message::makeHelloAck("WorkerB", adapter.name, vramMb, s_workerCaps);
     if (!conn.sendMessage(ack)) {
         std::cerr << "[worker] Failed to send HELLO_ACK\n";
         return;
@@ -144,6 +181,30 @@ static void handleConnection(dgpu::networking::TcpConnection conn,
                     static_cast<uint32_t>(pl.size()));
                 resp.header.status      = _byteswap_ulong(
                     static_cast<uint32_t>(TaskStatus::InvalidRequest));
+                resp.payload            = std::move(pl);
+                conn.sendMessage(resp);
+                continue;
+            }
+
+            // Validate against worker capabilities
+            if (!s_workerCaps.supportsTask(req.type, req.width, req.height)) {
+                std::cerr << "[worker] Task " << req.taskId << " rejected: unsupported task type="
+                          << static_cast<uint32_t>(req.type) << " or bounds "
+                          << req.width << "x" << req.height << '\n';
+                TaskResult err;
+                err.taskId = req.taskId;
+                err.status = TaskStatus::UnsupportedTask;
+                Message resp;
+                auto pl = err.serialise();
+                resp.header.magic       = _byteswap_ulong(MAGIC);
+                resp.header.version     = _byteswap_ushort(PROTO_VERSION);
+                resp.header.messageType = _byteswap_ushort(
+                    static_cast<uint16_t>(MessageType::TaskError));
+                resp.header.taskId      = _byteswap_uint64(req.taskId);
+                resp.header.payloadSize = _byteswap_ulong(
+                    static_cast<uint32_t>(pl.size()));
+                resp.header.status      = _byteswap_ulong(
+                    static_cast<uint32_t>(TaskStatus::UnsupportedTask));
                 resp.payload            = std::move(pl);
                 conn.sendMessage(resp);
                 continue;
@@ -240,6 +301,28 @@ int main(int argc, char* argv[]) {
         return 2;
     }
     std::cout << "[worker] GPU ready: " << executor.adapterInfo().name << '\n';
+
+    // Populate worker capabilities
+    const auto& adapter = executor.adapterInfo();
+    s_workerCaps.workerId = getOrCreateWorkerId();
+    char hostBuf[256];
+    DWORD hostLen = sizeof(hostBuf);
+    if (GetComputerNameA(hostBuf, &hostLen)) {
+        s_workerCaps.hostname = hostBuf;
+    } else {
+        s_workerCaps.hostname = "WorkerB";
+    }
+    s_workerCaps.gpuName        = adapter.name;
+    s_workerCaps.vramBytes      = adapter.dedicatedVideoMemoryBytes;
+    s_workerCaps.supportedTasks = dgpu::protocol::TaskCap_Blur | dgpu::protocol::TaskCap_EdgeDetection;
+    s_workerCaps.maxWidth       = 4096;
+    s_workerCaps.maxHeight      = 4096;
+    s_workerCaps.maxBatchSize   = 64;
+
+    std::cout << "[worker] Registered Worker ID: " << s_workerCaps.workerId << '\n';
+    std::cout << "[worker] Capabilities: GPU=\"" << s_workerCaps.gpuName
+              << "\" VRAM=" << (s_workerCaps.vramBytes / (1024 * 1024)) << " MB, "
+              << "Max Resolution=" << s_workerCaps.maxWidth << "x" << s_workerCaps.maxHeight << '\n';
 
     // Signal handling
     std::signal(SIGINT,  handleSignal);

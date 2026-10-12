@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include "networking/tcp_connection.hpp"
+#include "networking/health_monitor.hpp"
 #include "protocol/message.hpp"
 #include "d3d12/d3d12_context.hpp"
 #include "d3d12/gpu_executor.hpp"
@@ -1101,6 +1102,14 @@ int main(int argc, char* argv[]) {
         remoteAvailable = remoteClient.connect(workerHost, workerPort);
         if (remoteAvailable) {
             std::cout << "[host] Handshake verified with worker at " << workerHost << ":" << workerPort << '\n';
+            if (remoteClient.hasCapabilities()) {
+                const auto& caps = remoteClient.capabilities();
+                std::cout << "[host] Registered Worker ID: " << caps.workerId << '\n';
+                std::cout << "[host] Worker Capabilities: GPU=\"" << caps.gpuName << "\""
+                          << " VRAM=" << (caps.vramBytes / (1024 * 1024)) << " MB, "
+                          << "Max Resolution=" << caps.maxWidth << "x" << caps.maxHeight << ", "
+                          << "Supported Tasks Bitmask=0x" << std::hex << caps.supportedTasks << std::dec << '\n';
+            }
             if (!remoteClient.ping()) {
                 std::cerr << "[host] Ping failed — switching to local-only mode\n";
                 remoteAvailable = false;
@@ -1115,6 +1124,23 @@ int main(int argc, char* argv[]) {
 
     // 4. Initialise JobScheduler (wires localExec and remoteClient together)
     dgpu::host::JobScheduler scheduler;
+    if (remoteAvailable && remoteClient.hasCapabilities()) {
+        scheduler.setWorkerCapabilities(remoteClient.capabilities());
+    }
+
+    // Initialise Worker Health Monitor
+    std::unique_ptr<dgpu::networking::WorkerHealthMonitor> healthMonitor;
+    if (remoteAvailable) {
+        healthMonitor = std::make_unique<dgpu::networking::WorkerHealthMonitor>(
+            remoteClient, workerHost, workerPort);
+        healthMonitor->setStateCallback([](dgpu::networking::WorkerHealthState oldS,
+                                           dgpu::networking::WorkerHealthState newS) {
+            std::cout << "[host] Health State Transition: "
+                      << dgpu::networking::healthStateToString(oldS) << " -> "
+                      << dgpu::networking::healthStateToString(newS) << '\n';
+        });
+        healthMonitor->start();
+    }
     scheduler.setLocalExecutor([&localExec](const dgpu::protocol::TaskRequest& req) {
         return localExec.execute(req);
     });
@@ -1193,6 +1219,7 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "└────────────────────────────────────┴──────────┴──────────┴──────────┘\n";
 
+    if (healthMonitor) healthMonitor->stop();
     scheduler.stop();
     if (remoteAvailable) remoteClient.disconnect();
 

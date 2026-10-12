@@ -38,6 +38,8 @@ Direct pushes to `develop` and `main` branches are **strictly forbidden**. All c
    > Once the AI opens a PR, it must **STOP** and provide the PR link to the user.
    - The user reviews the PR diff on GitHub.
    - The user merges the PR (Squash and Merge) or requests changes.
+   - **Branch Auto-Deletion**: Once merged, the feature branch is automatically deleted on GitHub (`delete_branch_on_merge: true`).
+   - **Permanent Base Branches**: `main` and `develop` are permanent base branches and **CAN NEVER BE DELETED**.
    - Once the user merges into `develop`, the release pipeline updates `develop-latest`.
    - Merging `develop` into `main` updates the production `main-latest` release.
 

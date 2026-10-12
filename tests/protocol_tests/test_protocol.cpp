@@ -238,6 +238,111 @@ static void test_lz4_large_buffer_compression() {
     CHECK(decompressed == raw);
 }
 
+// ─── Worker Capabilities & Protocol v2 Tests ─────────────────────────────────
+
+static void test_workerCapabilities_roundtrip() {
+    WorkerCapabilities caps;
+    caps.workerId       = "12345678-abcd-ef01-2345-6789abcdef01";
+    caps.hostname       = "Laptop-B";
+    caps.gpuName        = "NVIDIA GeForce GTX 1650 Ti";
+    caps.vramBytes      = 4ull * 1024ull * 1024ull * 1024ull;
+    caps.supportedTasks = TaskCap_Blur;
+    caps.maxWidth       = 1920;
+    caps.maxHeight      = 1080;
+    caps.maxBatchSize   = 32;
+
+    auto bytes = caps.serialise();
+    auto recovered = WorkerCapabilities::deserialise(bytes);
+
+    CHECK(recovered.workerId       == caps.workerId);
+    CHECK(recovered.hostname       == caps.hostname);
+    CHECK(recovered.gpuName        == caps.gpuName);
+    CHECK(recovered.vramBytes      == caps.vramBytes);
+    CHECK(recovered.supportedTasks == caps.supportedTasks);
+    CHECK(recovered.maxWidth       == caps.maxWidth);
+    CHECK(recovered.maxHeight      == caps.maxHeight);
+    CHECK(recovered.maxBatchSize   == caps.maxBatchSize);
+}
+
+static void test_workerCapabilities_supportsTask() {
+    WorkerCapabilities caps;
+    caps.supportedTasks = TaskCap_Blur; // Only Blur supported
+    caps.maxWidth       = 1920;
+    caps.maxHeight      = 1080;
+
+    // Supported within bounds
+    CHECK(caps.supportsTask(TaskType::Blur, 1920, 1080));
+    CHECK(caps.supportsTask(TaskType::Blur, 1280, 720));
+
+    // Unsupported task type
+    CHECK(!caps.supportsTask(TaskType::EdgeDetection, 1920, 1080));
+
+    // Exceeding resolution bounds
+    CHECK(!caps.supportsTask(TaskType::Blur, 2560, 1440));
+    CHECK(!caps.supportsTask(TaskType::Blur, 1920, 1081));
+    CHECK(!caps.supportsTask(TaskType::Blur, 0, 1080));
+    CHECK(!caps.supportsTask(TaskType::Blur, 1920, 0));
+}
+
+static void test_hello_v2_capabilities_roundtrip() {
+    WorkerCapabilities caps;
+    caps.workerId       = "uuid-9876";
+    caps.hostname       = "WorkerHost";
+    caps.gpuName        = "RTX 3050";
+    caps.vramBytes      = 4096ull * 1024ull * 1024ull;
+    caps.supportedTasks = TaskCap_Blur | TaskCap_EdgeDetection;
+    caps.maxWidth       = 3840;
+    caps.maxHeight      = 2160;
+    caps.maxBatchSize   = 64;
+
+    HelloPayload hp;
+    hp.hostname     = "WorkerHost";
+    hp.gpuName      = "RTX 3050";
+    hp.vramMb       = 4096;
+    hp.capabilities = caps;
+
+    auto bytes = hp.serialise();
+    auto rec   = HelloPayload::deserialise(bytes);
+
+    CHECK(rec.hostname == "WorkerHost");
+    CHECK(rec.gpuName  == "RTX 3050");
+    CHECK(rec.vramMb   == 4096);
+    CHECK(rec.capabilities.workerId     == "uuid-9876");
+    CHECK(rec.capabilities.vramBytes    == 4096ull * 1024ull * 1024ull);
+    CHECK(rec.capabilities.supportedTasks == (TaskCap_Blur | TaskCap_EdgeDetection));
+    CHECK(rec.capabilities.maxWidth     == 3840);
+    CHECK(rec.capabilities.maxHeight    == 2160);
+    CHECK(rec.capabilities.maxBatchSize == 64);
+}
+
+static void test_hello_v1_backward_compatibility() {
+    // Construct wire buffer in exact Protocol v1 format (3 fields, no trailing capability bytes)
+    std::vector<std::byte> v1Buf;
+    auto appendStr = [&](const std::string& s) {
+        uint32_t len = _byteswap_ulong(static_cast<uint32_t>(s.size()));
+        const auto* pLen = reinterpret_cast<const std::byte*>(&len);
+        v1Buf.insert(v1Buf.end(), pLen, pLen + 4);
+        const auto* pStr = reinterpret_cast<const std::byte*>(s.data());
+        v1Buf.insert(v1Buf.end(), pStr, pStr + s.size());
+    };
+    appendStr("LegacyWorker");
+    appendStr("GTX 1060");
+    uint32_t vram = _byteswap_ulong(3072);
+    const auto* pVram = reinterpret_cast<const std::byte*>(&vram);
+    v1Buf.insert(v1Buf.end(), pVram, pVram + 4);
+
+    // Deserialise should succeed without throwing and populate sensible defaults
+    HelloPayload hp = HelloPayload::deserialise(v1Buf);
+    CHECK(hp.hostname == "LegacyWorker");
+    CHECK(hp.gpuName  == "GTX 1060");
+    CHECK(hp.vramMb   == 3072);
+    CHECK(hp.capabilities.hostname == "LegacyWorker");
+    CHECK(hp.capabilities.gpuName  == "GTX 1060");
+    CHECK(hp.capabilities.vramBytes == 3072ull * 1024ull * 1024ull);
+    CHECK(hp.capabilities.supportsTask(TaskType::Blur, 1920, 1080));
+    CHECK(hp.capabilities.supportsTask(TaskType::EdgeDetection, 1920, 1080));
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 int main() {
@@ -256,6 +361,10 @@ int main() {
     test_deserialise_invalid_dimensions_rejected();
     test_taskResult_invalid_status_rejected();
     test_lz4_large_buffer_compression();
+    test_workerCapabilities_roundtrip();
+    test_workerCapabilities_supportsTask();
+    test_hello_v2_capabilities_roundtrip();
+    test_hello_v1_backward_compatibility();
 
     std::cout << g_passed << " passed, " << g_failed << " failed.\n";
     return g_failed == 0 ? 0 : 1;
