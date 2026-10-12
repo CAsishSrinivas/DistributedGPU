@@ -13,6 +13,7 @@
 #include "batch_scheduler.hpp"
 #include "frame_compositor.hpp"
 #include "networking/tcp_connection.hpp"
+#include "networking/interface_discovery.hpp"
 #include "pipeline_executor.hpp"
 #include "protocol/adaptive_transfer_policy.hpp"
 #include "protocol/message.hpp"
@@ -285,7 +286,7 @@ static void exportMatrixJson(const std::filesystem::path& path,
 static std::vector<ResolutionBenchmarkResult> runBenchmarkMatrix(
     uint32_t warmup,
     uint32_t runs,
-    const std::string& workerEndpoint,
+    const networking::EndpointConfig& endpointCfg,
     std::string& outGpuName)
 {
     networking::WinsockInit wsa;
@@ -303,10 +304,22 @@ static std::vector<ResolutionBenchmarkResult> runBenchmarkMatrix(
         outGpuName = "CPU Reference Blur (Fallback)";
     }
 
+    std::string epDisplay = "(Simulated remote pipeline)";
+    if (!endpointCfg.host.empty() && endpointCfg.host != "none") {
+        epDisplay = endpointCfg.host + ":" + std::to_string(endpointCfg.port) +
+                    " [" + std::string(networking::transportTypeToString(endpointCfg.transport)) + "]";
+        if (!endpointCfg.interfaceName.empty()) {
+            epDisplay += " (interface: " + endpointCfg.interfaceName + ")";
+        }
+        if (!endpointCfg.localBindIp.empty()) {
+            epDisplay += " (bound IP: " + endpointCfg.localBindIp + ")";
+        }
+    }
+
     std::cout << "\n========================================================================================\n";
     std::cout << " DISTRIBUTED GPU END-TO-END BENCHMARK MATRIX (Phase 2.7)\n";
     std::cout << " Primary GPU: " << outGpuName << "\n";
-    std::cout << " Remote Worker: " << (workerEndpoint.empty() ? "(Simulated remote pipeline)" : workerEndpoint) << "\n";
+    std::cout << " Remote Worker: " << epDisplay << "\n";
     std::cout << " Parameters: " << warmup << " warmup runs, " << runs << " repetitions per strategy\n";
     std::cout << "========================================================================================\n\n";
 
@@ -323,15 +336,10 @@ static std::vector<ResolutionBenchmarkResult> runBenchmarkMatrix(
     // Setup Remote Execution lambda (Live TCP or Simulated Worker)
     networking::TaskClient remoteClient;
     bool liveWorker = false;
-    if (!workerEndpoint.empty()) {
-        auto colon = workerEndpoint.find(':');
-        if (colon != std::string::npos) {
-            std::string host = workerEndpoint.substr(0, colon);
-            uint16_t port = static_cast<uint16_t>(std::stoi(workerEndpoint.substr(colon + 1)));
-            liveWorker = remoteClient.connect(host, port);
-            if (liveWorker) {
-                std::cout << "  Connected to live worker: " << workerEndpoint << " (" << remoteClient.capabilities().gpuName << ")\n";
-            }
+    if (!endpointCfg.host.empty() && endpointCfg.host != "none") {
+        liveWorker = remoteClient.connect(endpointCfg);
+        if (liveWorker) {
+            std::cout << "  Connected to live worker: " << epDisplay << " (" << remoteClient.capabilities().gpuName << ")\n";
         }
     }
 
@@ -506,7 +514,8 @@ int main(int argc, char* argv[]) {
     bool runMatrix = false;
     uint32_t warmup = 3;
     uint32_t runs   = 10;
-    std::string workerEndpoint = "";
+    networking::EndpointConfig endpointCfg;
+    endpointCfg.host = ""; // Empty indicates local simulated remote unless specified
     std::filesystem::path csvPath = "benchmark_matrix.csv";
     std::filesystem::path jsonPath = "benchmark_matrix.json";
 
@@ -519,7 +528,28 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--runs" && i + 1 < argc) {
             runs = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--worker" && i + 1 < argc) {
-            workerEndpoint = argv[++i];
+            endpointCfg = networking::EndpointConfig::parse(argv[++i]);
+        } else if (arg == "--worker-ip" && i + 1 < argc) {
+            endpointCfg.host = argv[++i];
+        } else if (arg == "--port" && i + 1 < argc) {
+            endpointCfg.port = static_cast<uint16_t>(std::stoul(argv[++i]));
+        } else if (arg == "--transport" && i + 1 < argc) {
+            endpointCfg.transport = networking::stringToTransportType(argv[++i]);
+        } else if (arg == "--interface" && i + 1 < argc) {
+            endpointCfg.interfaceName = argv[++i];
+        } else if (arg == "--bind-ip" && i + 1 < argc) {
+            endpointCfg.localBindIp = argv[++i];
+        } else if (arg == "--list-interfaces") {
+            auto ifaces = networking::InterfaceDiscovery::enumerateInterfaces();
+            std::cout << "Available Network Interfaces:\n";
+            for (const auto& iface : ifaces) {
+                std::cout << "  - " << iface.friendlyName << " [" << networking::interfaceTypeToString(iface.type) << "]"
+                          << (iface.isUp ? " (UP)" : " (DOWN)")
+                          << " IP: " << (iface.ipv4Address.empty() ? "none" : iface.ipv4Address)
+                          << " Speed: " << (iface.linkSpeedBps / 1'000'000) << " Mbps\n"
+                          << "    Desc: " << iface.description << "\n";
+            }
+            return 0;
         } else if (arg == "--export-csv" && i + 1 < argc) {
             csvPath = argv[++i];
         } else if (arg == "--export-json" && i + 1 < argc) {
@@ -530,6 +560,12 @@ int main(int argc, char* argv[]) {
                       << "  --warmup <N>          Warmup runs before measurement (default: 3)\n"
                       << "  --runs <N>            Measured repetitions per strategy (default: 10)\n"
                       << "  --worker <host:port>  Connect to remote worker\n"
+                      << "  --worker-ip <ip>      Remote worker IP\n"
+                      << "  --port <port>         Remote worker port (default: 7777)\n"
+                      << "  --transport <t>       Transport mode: auto, tcp, or usb4 (default: auto)\n"
+                      << "  --interface <name>    Explicit network adapter for interface binding\n"
+                      << "  --bind-ip <ip>        Local interface IP to bind before connecting\n"
+                      << "  --list-interfaces     List network interfaces and exit\n"
                       << "  --export-csv <path>   Export CSV report (default: benchmark_matrix.csv)\n"
                       << "  --export-json <path>  Export JSON report (default: benchmark_matrix.json)\n"
                       << "  -h, --help            Show usage information\n";
@@ -538,7 +574,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::string gpuName = "Primary GPU";
-    auto matrixResults = runBenchmarkMatrix(warmup, runs, workerEndpoint, gpuName);
+    auto matrixResults = runBenchmarkMatrix(warmup, runs, endpointCfg, gpuName);
 
     exportMatrixCsv(csvPath, matrixResults);
     exportMatrixJson(jsonPath, matrixResults, gpuName, warmup, runs);

@@ -10,6 +10,8 @@
 
 #include "networking/tcp_connection.hpp"
 #include "networking/health_monitor.hpp"
+#include "networking/transport_config.hpp"
+#include "networking/interface_discovery.hpp"
 #include "protocol/message.hpp"
 #include "d3d12/d3d12_context.hpp"
 #include "d3d12/gpu_executor.hpp"
@@ -1007,6 +1009,9 @@ int main(int argc, char* argv[]) {
     uint32_t    repetitions = 15;
     uint32_t    warmup = 3;
     int         sceneType = 0; // 0 = gradient, 1 = noisy
+    std::string transportStr = "auto";
+    std::string interfaceName = "";
+    std::string localBindIp = "";
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1015,7 +1020,12 @@ int main(int argc, char* argv[]) {
                       << "Options:\n"
                       << "  -h, --help           Show this help message and exit\n"
                       << "  --host <ip>          Remote worker IP address (default: 127.0.0.1)\n"
+                      << "  --worker-ip <ip>     Alias for --host\n"
                       << "  --port <port>        Remote worker port (default: 7777)\n"
+                      << "  --transport <t>      Transport mode: auto, tcp, or usb4 (default: auto)\n"
+                      << "  --interface <name>   Network interface alias/name for explicit binding\n"
+                      << "  --bind-ip <ip>       Local interface IP to bind before connecting\n"
+                      << "  --list-interfaces    List available network adapters and exit\n"
                       << "  --link-mbps <mbps>   Network link bandwidth in Mbps (default: 100)\n"
                       << "  --link-latency-ms <ms> Base round-trip network latency in ms (default: 1)\n"
                       << "  --repetitions <n>    Number of benchmark runs per mode (default: 15)\n"
@@ -1033,8 +1043,19 @@ int main(int argc, char* argv[]) {
                       << "Examples:\n"
                       << "  host.exe --local-only\n"
                       << "  host.exe --stage5-only 192.168.1.14 7777\n"
-                      << "  host.exe --stage5-only --repetitions 30 192.168.1.14 7777\n"
-                      << "  host.exe --link-mbps 100 192.168.1.14 7777\n";
+                      << "  host.exe --transport usb4 --worker-ip 192.168.100.2\n"
+                      << "  host.exe --interface \"Ethernet\" --host 192.168.1.14\n";
+            return 0;
+        } else if (arg == "--list-interfaces") {
+            auto ifaces = dgpu::networking::InterfaceDiscovery::enumerateInterfaces();
+            std::cout << "Available Network Interfaces:\n";
+            for (const auto& iface : ifaces) {
+                std::cout << "  - " << iface.friendlyName << " [" << dgpu::networking::interfaceTypeToString(iface.type) << "]"
+                          << (iface.isUp ? " (UP)" : " (DOWN)")
+                          << " IP: " << (iface.ipv4Address.empty() ? "none" : iface.ipv4Address)
+                          << " Speed: " << (iface.linkSpeedBps / 1'000'000) << " Mbps\n"
+                          << "    Desc: " << iface.description << "\n";
+            }
             return 0;
         } else if (arg == "--validate") {
             stage5Only = true;
@@ -1067,10 +1088,16 @@ int main(int argc, char* argv[]) {
             linkMbps = static_cast<uint32_t>(std::stoi(argv[++i]));
         } else if (arg == "--link-latency-ms" && i + 1 < argc) {
             linkLatencyMs = static_cast<uint32_t>(std::stoi(argv[++i]));
-        } else if (arg == "--host" && i + 1 < argc) {
+        } else if ((arg == "--host" || arg == "--worker-ip") && i + 1 < argc) {
             workerHost = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
             workerPort = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--transport" && i + 1 < argc) {
+            transportStr = argv[++i];
+        } else if (arg == "--interface" && i + 1 < argc) {
+            interfaceName = argv[++i];
+        } else if (arg == "--bind-ip" && i + 1 < argc) {
+            localBindIp = argv[++i];
         } else if (!arg.starts_with("-")) {
             if (!hasPositionalHost) {
                 workerHost = arg;
@@ -1108,8 +1135,20 @@ int main(int argc, char* argv[]) {
     if (localOnly) {
         std::cout << "[host] --local-only mode selected: skipping remote connection\n";
     } else {
-        std::cout << "[host] Connecting to remote worker at " << workerHost << ":" << workerPort << "...\n";
-        remoteAvailable = remoteClient.connect(workerHost, workerPort);
+        dgpu::networking::EndpointConfig endpoint;
+        endpoint.host          = workerHost;
+        endpoint.port          = workerPort;
+        endpoint.transport     = dgpu::networking::stringToTransportType(transportStr);
+        endpoint.interfaceName = interfaceName;
+        endpoint.localBindIp   = localBindIp;
+
+        std::cout << "[host] Connecting to remote worker (" << dgpu::networking::transportTypeToString(endpoint.transport)
+                  << ") at " << workerHost << ":" << workerPort;
+        if (!interfaceName.empty()) std::cout << " [interface: " << interfaceName << "]";
+        if (!localBindIp.empty())   std::cout << " [bound local IP: " << localBindIp << "]";
+        std::cout << "...\n";
+
+        remoteAvailable = remoteClient.connect(endpoint);
         if (remoteAvailable) {
             std::cout << "[host] Handshake verified with worker at " << workerHost << ":" << workerPort << '\n';
             if (remoteClient.hasCapabilities()) {
