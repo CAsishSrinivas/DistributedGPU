@@ -1,16 +1,17 @@
-name: Build, Test & Release
+name: Build, Package & Release
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "develop" ]
     tags: [ "v*" ]
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build-and-test:
-    name: Build & Package Windows x64
+  build-and-release:
+    name: Build & Release Package (Windows x64)
     runs-on: windows-latest
 
     steps:
@@ -29,21 +30,58 @@ jobs:
     - name: Run CTest test suite
       run: ctest --test-dir build -C Release --output-on-failure
 
-    - name: Stage Release Package
+    - name: Stage & Compress Release Package
+      id: package
       shell: pwsh
       run: |
+        $branch = "${{ github.ref_name }}"
+        $isDevelop = ($branch -eq "develop")
+        $assetName = if ($isDevelop) { "DistributedGPU-windows-x64-develop.zip" } else { "DistributedGPU-windows-x64-main.zip" }
+        $tag = if ($isDevelop) { "develop-latest" } else { "main-latest" }
+
         $pkg = "dist"
-        New-Item -ItemType Directory -Path "$pkg/bin" -Force
-        New-Item -ItemType Directory -Path "$pkg/shaders" -Force
+        New-Item -ItemType Directory -Path "$pkg/bin" -Force | Out-Null
+        New-Item -ItemType Directory -Path "$pkg/shaders" -Force | Out-Null
         Copy-Item "build/bin/Release/*.exe" "$pkg/bin/" -Force
         Copy-Item "build/bin/Release/*.dll" "$pkg/bin/" -Force
         Copy-Item "shaders/*" "$pkg/shaders/" -Force
         Set-Content -Path "$pkg/dgpu.ini" -Value "192.168.1.14`n# writeback=1"
-        Compress-Archive -Path "$pkg/*" -DestinationPath "DistributedGPU-windows-x64.zip" -Force
+        Compress-Archive -Path "$pkg/*" -DestinationPath $assetName -Force
+
+        "asset_name=$assetName" >> $env:GITHUB_OUTPUT
+        "release_tag=$tag" >> $env:GITHUB_OUTPUT
+        "is_prerelease=$isDevelop" >> $env:GITHUB_OUTPUT
 
     - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: DistributedGPU-windows-x64
-        path: DistributedGPU-windows-x64.zip
+        name: ${{ steps.package.outputs.asset_name }}
+        path: ${{ steps.package.outputs.asset_name }}
         retention-days: 30
+
+    - name: Publish / Update GitHub Release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      shell: pwsh
+      run: |
+        $tag = "${{ steps.package.outputs.release_tag }}"
+        $asset = "${{ steps.package.outputs.asset_name }}"
+        $isPre = "${{ steps.package.outputs.is_prerelease }}" -eq "True"
+
+        $title = if ($isPre) { "DistributedGPU Develop (Latest Build)" } else { "DistributedGPU Production (Stable)" }
+        $notes = if ($isPre) {
+          "Automated continuous integration release from develop branch for Laptop B / worker testing nodes."
+        } else {
+          "Production release from main branch. Validated stable release."
+        }
+
+        # Check if release already exists
+        $releaseExists = gh release view $tag --json tagName 2>$null
+        if ($LASTEXITCODE -eq 0) {
+          Write-Host "Updating existing release $tag..." -ForegroundColor Cyan
+          gh release upload $tag $asset --clobber
+        } else {
+          Write-Host "Creating new release $tag..." -ForegroundColor Cyan
+          $preFlag = if ($isPre) { "--prerelease" } else { "" }
+          gh release create $tag $asset --title $title --notes $notes $preFlag
+        }
