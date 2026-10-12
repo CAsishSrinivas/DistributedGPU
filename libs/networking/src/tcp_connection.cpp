@@ -428,7 +428,12 @@ protocol::TaskResult TaskClient::submit(const protocol::TaskRequest& req) {
     }
 
     // Build SUBMIT_TASK message
+    auto t_ser0 = std::chrono::steady_clock::now();
     auto payload = req.serialise();
+    auto t_ser1 = std::chrono::steady_clock::now();
+    uint64_t serializationUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(t_ser1 - t_ser0).count());
+
     protocol::Message msg;
     msg.header.magic       = _byteswap_ulong(protocol::MAGIC);
     msg.header.version     = _byteswap_ushort(protocol::PROTO_VERSION);
@@ -436,6 +441,7 @@ protocol::TaskResult TaskClient::submit(const protocol::TaskRequest& req) {
     msg.header.status      = 0;
 
     TransferMetrics tm;
+    tm.serializationUs = serializationUs;
     tm.uncompressedSendBytes = payload.size();
 
     bool doCompress = false;
@@ -472,6 +478,7 @@ protocol::TaskResult TaskClient::submit(const protocol::TaskRequest& req) {
     }
     msg.header.payloadSize = _byteswap_ulong(static_cast<uint32_t>(msg.payload.size()));
 
+    auto t_send0 = std::chrono::steady_clock::now();
     if (!m_conn.sendMessage(msg)) {
         m_conn.close();
         protocol::TaskResult err;
@@ -479,8 +486,12 @@ protocol::TaskResult TaskClient::submit(const protocol::TaskRequest& req) {
         err.status = protocol::TaskStatus::InternalError;
         return err;
     }
+    auto t_send1 = std::chrono::steady_clock::now();
+    tm.sendFlightUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(t_send1 - t_send0).count());
 
     // Wait for response
+    auto t_recv0 = std::chrono::steady_clock::now();
     protocol::Message resp;
     if (!m_conn.receiveMessage(resp)) {
         m_conn.close();
@@ -489,6 +500,9 @@ protocol::TaskResult TaskClient::submit(const protocol::TaskRequest& req) {
         err.status = protocol::TaskStatus::InternalError;
         return err;
     }
+    auto t_recv1 = std::chrono::steady_clock::now();
+    tm.recvWaitUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(t_recv1 - t_recv0).count());
 
     uint32_t magic      = _byteswap_ulong(resp.header.magic);
     uint16_t version    = _byteswap_ushort(resp.header.version);
@@ -564,9 +578,28 @@ protocol::TaskResult TaskClient::submit(const protocol::TaskRequest& req) {
             tm.uncompressedRecvBytes = resp.payload.size();
             tm.compressionRatioRecv = 1.0f;
         }
+        auto d_des0 = std::chrono::steady_clock::now();
+        auto res = protocol::TaskResult::deserialise(payloadSpan);
+        auto d_des1 = std::chrono::steady_clock::now();
+        tm.deserializationUs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(d_des1 - d_des0).count());
+
+        uint64_t workerExecUs = (res.totalUs > 0) ? res.totalUs : res.gpuUs;
+        tm.pureNetworkRttUs = tm.sendFlightUs + ((tm.recvWaitUs > workerExecUs) ? (tm.recvWaitUs - workerExecUs) : 0);
         m_lastMetrics = tm;
 
-        auto res = protocol::TaskResult::deserialise(payloadSpan);
+        res.serializeUs           = tm.serializationUs;
+        res.compressUs            = tm.compressionUs;
+        res.sendFlightUs          = tm.sendFlightUs;
+        res.recvWaitUs            = tm.recvWaitUs;
+        res.decompressUs          = tm.decompressionUs;
+        res.deserializeUs         = tm.deserializationUs;
+        res.pureNetworkRttUs      = tm.pureNetworkRttUs;
+        res.uncompressedSendBytes = tm.uncompressedSendBytes;
+        res.wireSendBytes         = tm.compressedSendBytes;
+        res.wireRecvBytes         = tm.compressedRecvBytes;
+        res.uncompressedRecvBytes = tm.uncompressedRecvBytes;
+
         if (res.taskId != req.taskId) {
             res.status = protocol::TaskStatus::InternalError;
         }

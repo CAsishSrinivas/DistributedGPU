@@ -193,6 +193,19 @@ struct TaskResult {
     uint64_t readbackUs{};
     uint64_t totalUs{};
 
+    // Client-side breakdown (measured locally during dispatch, not transmitted on wire)
+    uint64_t serializeUs{0};
+    uint64_t compressUs{0};
+    uint64_t sendFlightUs{0};
+    uint64_t recvWaitUs{0};
+    uint64_t decompressUs{0};
+    uint64_t deserializeUs{0};
+    uint64_t pureNetworkRttUs{0};
+    size_t   uncompressedSendBytes{0};
+    size_t   wireSendBytes{0};
+    size_t   wireRecvBytes{0};
+    size_t   uncompressedRecvBytes{0};
+
     [[nodiscard]] std::vector<std::byte> serialise() const;
     static TaskResult deserialise(std::span<const std::byte> data);
 };
