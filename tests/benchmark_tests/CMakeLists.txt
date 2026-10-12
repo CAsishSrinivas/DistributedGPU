@@ -88,3 +88,24 @@ target_link_libraries(test_resource_pool PRIVATE
     $<$<BOOL:${D3D12_AVAILABLE}>:dgpu_d3d12>
 )
 add_test(NAME resource_pool_tests COMMAND test_resource_pool)
+
+add_executable(test_benchmark_matrix
+    test_benchmark_matrix.cpp
+    ../../apps/host/workload_cost_model.cpp
+    ../../apps/host/workload_partitioner.cpp
+    ../../apps/host/statistical_validator.cpp
+    ../../apps/host/batch_scheduler.cpp
+    ../../apps/host/pipeline_executor.cpp
+    ../../apps/host/work_distributor.cpp
+    ../../apps/host/frame_compositor.cpp
+)
+target_include_directories(test_benchmark_matrix PRIVATE ../../apps/host ../.. ../../libs)
+target_link_libraries(test_benchmark_matrix PRIVATE
+    dgpu_compile_options
+    dgpu_protocol
+    dgpu_networking
+    dgpu_task_runtime
+    dgpu_telemetry
+    $<$<BOOL:${D3D12_AVAILABLE}>:dgpu_d3d12>
+)
+add_test(NAME benchmark_matrix_tests COMMAND test_benchmark_matrix)
