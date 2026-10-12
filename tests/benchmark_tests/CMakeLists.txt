@@ -18,3 +18,16 @@ target_include_directories(test_partitioner PRIVATE ../../apps/host)
 target_link_libraries(test_partitioner PRIVATE dgpu_protocol)
 add_test(NAME partitioner_tests COMMAND test_partitioner)
 
+add_executable(test_cost_model
+    test_cost_model.cpp
+    ../../apps/host/workload_cost_model.cpp
+    ../../apps/host/workload_partitioner.cpp
+    ../../apps/host/job_scheduler.cpp
+)
+target_include_directories(test_cost_model PRIVATE ../../apps/host)
+target_link_libraries(test_cost_model PRIVATE
+    dgpu_compile_options
+    dgpu_protocol
+    dgpu_task_runtime
+)
+add_test(NAME cost_model_tests COMMAND test_cost_model)
