@@ -1,0 +1,25 @@
+#!/bin/sh
+# Git pre-push hook: Prevents direct pushes to 'main' and 'develop' branches.
+# Pushes must occur through feature branches and Pull Requests.
+
+if [ "$ALLOW_DIRECT_PUSH" = "1" ]; then
+    exit 0
+fi
+
+while read local_ref local_sha remote_ref remote_sha
+do
+    case "$remote_ref" in
+        refs/heads/main|refs/heads/develop)
+            echo "================================================================="
+            echo "[POLICY VIOLATION] Direct push to '$remote_ref' is forbidden!"
+            echo "  1. Create an issue on GitHub."
+            echo "  2. Branch off develop: git checkout -b feature/issue-<ID>-<name>"
+            echo "  3. Commit to your feature branch."
+            echo "  4. Submit a Pull Request targeting 'develop'."
+            echo "================================================================="
+            exit 1
+            ;;
+    esac
+done
+
+exit 0
