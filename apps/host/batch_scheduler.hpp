@@ -55,6 +55,11 @@ struct BatchRunMetrics {
     uint32_t tasksStolenByWorker{0};
     uint32_t tinyTasksRetainedLocally{0};
 
+    // Phase 2.3 Pipelined Execution Metrics
+    double   overlapFactor{1.0};
+    double   pipelineSpeedup{1.0};
+    uint32_t inFlightDepth{2};
+
     double maeVsReference{0.0};
     std::vector<TaskLatencyBreakdown> taskDetails;
 };
@@ -94,6 +99,14 @@ public:
         const std::vector<protocol::TaskRequest>& tasks, LocalExecFn localExec, RemoteExecFn remoteExec,
         bool remoteAvailable, const std::optional<protocol::WorkerCapabilities>& workerCaps = std::nullopt,
         uint64_t linkBandwidthBps = 12'500'000, uint64_t baseRttUs = 1000, double referenceHostThroughput = 0.0,
+        const std::vector<protocol::TaskResult>& referenceResults = {});
+
+    // ─── 2c. Phase 2.3: Pipelined Batch Execution ────────────────────────────
+    // Overlaps CPU LZ4 compression/decompression, transfers, and GPU computation
+    // using bounded in-flight double/multi-buffering.
+    [[nodiscard]] static BatchRunMetrics runPipelinedBatch(
+        const std::vector<protocol::TaskRequest>& tasks, LocalExecFn localExec, RemoteExecFn remoteExec,
+        bool remoteAvailable, uint32_t inFlightDepth = 2, double referenceHostThroughput = 0.0,
         const std::vector<protocol::TaskResult>& referenceResults = {});
 
     // ─── 3. Static Split Run ──────────────────────────────────────────────────

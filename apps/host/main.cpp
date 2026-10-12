@@ -572,6 +572,14 @@ static void runStage5ParallelWorkload(dgpu::gpu_executor::GpuExecutor& localExec
     auto dynamicMetrics = host::AdvancedBatchScheduler::runDynamicWorkStealing(
         sweepBatch, localExecFn, remoteExecFn, remoteAvailable, hostThroughput, refResults);
 
+    auto adaptiveMetrics = host::AdvancedBatchScheduler::runAdaptiveWorkStealing(
+        sweepBatch, localExecFn, remoteExecFn, remoteAvailable,
+        remoteClient.hasCapabilities() ? std::make_optional(remoteClient.capabilities()) : std::nullopt,
+        12'500'000, 1000, hostThroughput, refResults);
+
+    auto pipelinedMetrics = host::AdvancedBatchScheduler::runPipelinedBatch(
+        sweepBatch, localExecFn, remoteExecFn, remoteAvailable, 2, hostThroughput, refResults);
+
     std::cout << "\n  ┌──────────────────────────────┬────────────┬────────────┬─────────┬────────────┬────────────┬────────────┐\n";
     std::cout << "  │ Batch Scheduling Strategy    │ Batch Time │ Throughput │ Speedup │ P50 Latency│ P95 Latency│ Max (Tail) │\n";
     std::cout << "  ├──────────────────────────────┼────────────┼────────────┼─────────┼────────────┼────────────┼────────────┤\n";
@@ -579,6 +587,8 @@ static void runStage5ParallelWorkload(dgpu::gpu_executor::GpuExecutor& localExec
     host::AdvancedBatchScheduler::printMetricsSummary(static5050Metrics);
     host::AdvancedBatchScheduler::printMetricsSummary(optimalStaticMetrics);
     host::AdvancedBatchScheduler::printMetricsSummary(dynamicMetrics);
+    host::AdvancedBatchScheduler::printMetricsSummary(adaptiveMetrics);
+    host::AdvancedBatchScheduler::printMetricsSummary(pipelinedMetrics);
     std::cout << "  └──────────────────────────────┴────────────┴────────────┴─────────┴────────────┴────────────┴────────────┘\n";
     std::cout << std::format("  -> Dynamic Work-Stealing Split: Host (RTX 3050) = {} tasks, Worker (GTX 1650 Ti) = {} tasks\n",
                              dynamicMetrics.hostTasksExecuted, dynamicMetrics.workerTasksExecuted);
