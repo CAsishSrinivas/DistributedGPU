@@ -13,6 +13,22 @@
 > - Once the AI creates a Pull Request, it must **STOP** and provide the PR URL to the user.
 > - **ONLY the human user has the authority to review, approve, merge, or close Pull Requests.**
 
+### MANDATORY DETAILED DESCRIPTIONS FOR ISSUES & PRS
+> **Every Issue and PR must contain thorough, structured technical descriptions.** Brief or one-line summaries are unacceptable.
+
+1. **Issue Template Requirements**:
+   - `## Problem Statement & Context`: Background, system state, and why this work is needed.
+   - `## Objective & Requirements`: Concrete functional and architectural deliverables.
+   - `## Technical Specifications`: Proposed API, data structures, algorithms, or protocols.
+   - `## Acceptance Criteria`: Verifiable checklist for completion.
+
+2. **Pull Request Template Requirements**:
+   - `## Summary of Changes`: Overview of what was implemented.
+   - `## Motivation & Linked Issues`: Rationale and `Closes #<ID>`.
+   - `## Detailed Code Modifications`: List of files modified and key architectural decisions.
+   - `## Verification & Test Results`: Compilation evidence, CTest output, and benchmark numbers.
+   - `## Impact on Cross-Device Releases`: Effect on `develop` or `main` release artifacts.
+
 ---
 
 ## 2. Cross-Device Release Policy

@@ -40,3 +40,8 @@ Direct pushes to `develop` and `main` branches are **strictly forbidden**. All c
    - The user merges the PR (Squash and Merge) or requests changes.
    - Once the user merges into `develop`, the release pipeline updates `develop-latest`.
    - Merging `develop` into `main` updates the production `main-latest` release.
+
+6. **Detailed Documentation Standards**:
+   - **Issues**: Must contain `Problem Statement & Context`, `Objective & Requirements`, `Technical Specifications`, and `Acceptance Criteria`.
+   - **PRs**: Must contain `Summary of Changes`, `Motivation & Linked Issues`, `Detailed Code Modifications`, `Verification & Test Results`, and `Impact on Cross-Device Releases`.
+   - Brief or one-line descriptions are strictly unacceptable.
