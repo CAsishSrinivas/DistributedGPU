@@ -12,6 +12,8 @@ add_executable(test_partitioner
     ../../apps/host/workload_partitioner.cpp
     ../../apps/host/statistical_validator.cpp
     ../../apps/host/batch_scheduler.cpp
+    ../../apps/host/work_distributor.cpp
+    ../../apps/host/workload_cost_model.cpp
     ../../apps/host/frame_compositor.cpp
 )
 target_include_directories(test_partitioner PRIVATE ../../apps/host)
@@ -31,3 +33,19 @@ target_link_libraries(test_cost_model PRIVATE
     dgpu_task_runtime
 )
 add_test(NAME cost_model_tests COMMAND test_cost_model)
+
+add_executable(test_work_stealing
+    test_work_stealing.cpp
+    ../../apps/host/work_distributor.cpp
+    ../../apps/host/batch_scheduler.cpp
+    ../../apps/host/workload_cost_model.cpp
+    ../../apps/host/workload_partitioner.cpp
+    ../../apps/host/statistical_validator.cpp
+    ../../apps/host/frame_compositor.cpp
+)
+target_include_directories(test_work_stealing PRIVATE ../../apps/host)
+target_link_libraries(test_work_stealing PRIVATE
+    dgpu_compile_options
+    dgpu_protocol
+)
+add_test(NAME work_stealing_tests COMMAND test_work_stealing)

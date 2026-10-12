@@ -8,6 +8,7 @@
 #pragma once
 
 #include "protocol/message.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -26,7 +27,7 @@ struct TaskLatencyBreakdown {
     double cpuCodecMs{0.0};
     double gpuExecutionMs{0.0};
     double totalTurnaroundMs{0.0};
-    bool   success{true};
+    bool success{true};
 };
 
 struct BatchRunMetrics {
@@ -49,6 +50,11 @@ struct BatchRunMetrics {
     double meanQueueWaitMs{0.0};
     double meanWireTransferMs{0.0};
 
+    // Phase 2.2 Work-Stealing & Load Balancing Metrics
+    uint32_t tasksStolenByHost{0};
+    uint32_t tasksStolenByWorker{0};
+    uint32_t tinyTasksRetainedLocally{0};
+
     double maeVsReference{0.0};
     std::vector<TaskLatencyBreakdown> taskDetails;
 };
@@ -65,42 +71,41 @@ struct SweepPointResult {
 
 class AdvancedBatchScheduler {
 public:
-    using LocalExecFn  = std::function<protocol::TaskResult(const protocol::TaskRequest&)>;
+    using LocalExecFn = std::function<protocol::TaskResult(const protocol::TaskRequest&)>;
     using RemoteExecFn = std::function<protocol::TaskResult(const protocol::TaskRequest&)>;
 
     // ─── 1. Allocation Sweep ──────────────────────────────────────────────────
     // Evaluates static split points from 0/N to N/0 to map the full efficiency curve
-    [[nodiscard]] static std::vector<SweepPointResult> runAllocationSweep(
-        const std::vector<protocol::TaskRequest>& tasks,
-        LocalExecFn localExec,
-        RemoteExecFn remoteExec,
-        bool remoteAvailable,
-        uint32_t step = 4);
+    [[nodiscard]] static std::vector<SweepPointResult>
+    runAllocationSweep(const std::vector<protocol::TaskRequest>& tasks, LocalExecFn localExec, RemoteExecFn remoteExec,
+                       bool remoteAvailable, uint32_t step = 4);
 
     // ─── 2. Dynamic Work-Stealing with Bounded Queue ──────────────────────────
     // Worker and Host pull dynamically from a concurrent atomic queue with bounded prefetch
-    [[nodiscard]] static BatchRunMetrics runDynamicWorkStealing(
-        const std::vector<protocol::TaskRequest>& tasks,
-        LocalExecFn localExec,
-        RemoteExecFn remoteExec,
-        bool remoteAvailable,
-        double referenceHostThroughput = 0.0,
+    [[nodiscard]] static BatchRunMetrics
+    runDynamicWorkStealing(const std::vector<protocol::TaskRequest>& tasks, LocalExecFn localExec,
+                           RemoteExecFn remoteExec, bool remoteAvailable, double referenceHostThroughput = 0.0,
+                           const std::vector<protocol::TaskResult>& referenceResults = {});
+
+    // ─── 2b. Phase 2.2: Adaptive Work-Stealing Load Balancer ──────────────────
+    // Allocates tasks according to observed processing speeds, bounds queues,
+    // filters tiny jobs, and dynamically steals work between idle workers.
+    [[nodiscard]] static BatchRunMetrics runAdaptiveWorkStealing(
+        const std::vector<protocol::TaskRequest>& tasks, LocalExecFn localExec, RemoteExecFn remoteExec,
+        bool remoteAvailable, const std::optional<protocol::WorkerCapabilities>& workerCaps = std::nullopt,
+        uint64_t linkBandwidthBps = 12'500'000, uint64_t baseRttUs = 1000, double referenceHostThroughput = 0.0,
         const std::vector<protocol::TaskResult>& referenceResults = {});
 
     // ─── 3. Static Split Run ──────────────────────────────────────────────────
-    [[nodiscard]] static BatchRunMetrics runStaticSplit(
-        const std::vector<protocol::TaskRequest>& tasks,
-        uint32_t hostTaskCount,
-        LocalExecFn localExec,
-        RemoteExecFn remoteExec,
-        bool remoteAvailable,
-        double referenceHostThroughput = 0.0,
-        const std::vector<protocol::TaskResult>& referenceResults = {});
+    [[nodiscard]] static BatchRunMetrics runStaticSplit(const std::vector<protocol::TaskRequest>& tasks,
+                                                        uint32_t hostTaskCount, LocalExecFn localExec,
+                                                        RemoteExecFn remoteExec, bool remoteAvailable,
+                                                        double referenceHostThroughput = 0.0,
+                                                        const std::vector<protocol::TaskResult>& referenceResults = {});
 
     // ─── 4. Host Alone Reference Run ──────────────────────────────────────────
-    [[nodiscard]] static BatchRunMetrics runHostOnly(
-        const std::vector<protocol::TaskRequest>& tasks,
-        LocalExecFn localExec);
+    [[nodiscard]] static BatchRunMetrics runHostOnly(const std::vector<protocol::TaskRequest>& tasks,
+                                                     LocalExecFn localExec);
 
     // ─── Helper: Print Sweep Results Table ────────────────────────────────────
     static void printSweepTable(const std::vector<SweepPointResult>& sweep);
