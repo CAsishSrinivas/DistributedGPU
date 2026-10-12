@@ -7,6 +7,38 @@ A C++ system that lets two Windows laptops cooperate at the GPU level — starti
 | **A (Host)** | RTX 3050 · 4 GB | Primary rendering, compositing, display |
 | **B (Worker)** | GTX 1650 Ti · 4 GB | Remote compute tasks, returns results |
 
+## GitHub Workflow & Cross-Device Releases
+
+All source code and precompiled builds are managed through the private GitHub repository:  
+**[`https://github.com/CAsishSrinivas/DistributedGPU`](https://github.com/CAsishSrinivas/DistributedGPU)**
+
+No files or binaries need to be manually transferred between laptops.
+
+### 1. One-Click Setup on Laptop B (Worker)
+
+On **Laptop B** (GTX 1650 Ti), simply run this single PowerShell command to download the latest release, extract it, and start the worker daemon:
+
+```powershell
+# From the cloned repository root:
+.\scripts\update_laptop_b.ps1 -StartWorker
+```
+Or download [`DistributedGPU-windows-x64-v1.0.0.zip`](https://github.com/CAsishSrinivas/DistributedGPU/releases/tag/v1.0.0) directly from GitHub Releases.
+
+### 2. Publishing New Releases from Laptop A (Host)
+
+Whenever changes are validated on **Laptop A**, publish a new version directly to GitHub Releases in one command:
+
+```powershell
+.\scripts\publish_release.ps1 -Version "1.0.1"
+```
+This automatically:
+1. Compiles all targets in `Release` mode with MSVC.
+2. Runs the full CTest regression test suite.
+3. Packages the binaries, shaders, proxy DLLs, and default configuration.
+4. Creates a new GitHub Release and uploads the zip asset via the GitHub REST API.
+
+---
+
 ## Quick start
 
 ### Prerequisites
@@ -15,35 +47,36 @@ A C++ system that lets two Windows laptops cooperate at the GPU level — starti
 - Visual Studio 2022 with **Desktop development with C++** workload
 - Windows SDK 10.0.20348.0 or later (provides DirectX 12 headers)
 - NVIDIA drivers ≥ 528.x on both machines
-- 10 Gbps Ethernet cable between the laptops (or at least 1 Gbps for early testing)
+- 10 Gbps / 1 Gbps Ethernet cable or high-speed Wi-Fi between the laptops
 
-### Build
+### Build from Source
 
 ```powershell
-# Clone / open the project root
+# Clone the repository
+git clone https://github.com/CAsishSrinivas/DistributedGPU.git
 cd DistributedGPU
 
-# Configure (Debug — recommended for early milestones)
-cmake --preset windows-debug
+# Build Release binaries
+cmake -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
 
-# Build all targets
-cmake --build build/debug
-
-# Run unit tests
-ctest --preset default --output-on-failure
+# Run unit and integration tests
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-Binaries land in `build/debug/bin/`:
-- `benchmark.exe` — M0/M1 local GPU validation (run this first)
-- `worker.exe`    — run on **Laptop B**
-- `host.exe`      — run on **Laptop A** after worker is ready
+Binaries land in `build/bin/Release/`:
+- `benchmark.exe`    — M0/M1 local GPU validation
+- `worker.exe`       — Distributed worker daemon (run on **Laptop B**)
+- `host.exe`         — Distributed coordinator & Stage 5 benchmark (run on **Laptop A**)
+- `dxgi.dll`         — DirectX 12 live game proxy hook (e.g. for Elden Ring)
+- `game_adapter.exe` — Standalone game integration test harness
 
 ### First run order
 
-1. **Laptop B** — open a port: `worker.exe 7777`
-2. **Laptop A** — `host.exe 192.168.1.101 7777` (replace with Laptop B's IP)
+1. **Laptop B** — start worker: `.\build\bin\Release\worker.exe 7777`
+2. **Laptop A** — run host: `.\build\bin\Release\host.exe 192.168.1.14 7777`
 
-If the worker is unreachable, `host.exe` falls back to a local-only benchmark.
+If the worker is unreachable, `host.exe` falls back to local execution.
 
 ## Development roadmap
 
