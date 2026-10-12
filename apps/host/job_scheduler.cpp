@@ -1,12 +1,14 @@
 // apps/host/job_scheduler.cpp
-// Adaptive scheduler: EMA-based local vs remote decision + circuit breaker.
+// Workload-aware scheduler: Multi-strategy execution cost model + circuit breaker.
 
 #include "job_scheduler.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 
 namespace dgpu::host {
 
@@ -19,17 +21,16 @@ static double emaUpdate(double prev, double newSample) noexcept {
 
 // ─── JobScheduler::Impl ──────────────────────────────────────────────────────
 
-#include <unordered_map>
-
 struct JobScheduler::Impl {
-    task_runtime::TaskQueue                   queue;
-    task_runtime::CircuitBreaker              breaker;
-    SchedulerMetrics                          metrics;
+    task_runtime::TaskQueue queue;
+    task_runtime::CircuitBreaker breaker;
+    SchedulerMetrics metrics;
+    WorkloadCostModel costModel;
     std::unordered_map<uint64_t, ResolutionMetrics> resMap;
     std::optional<protocol::WorkerCapabilities> workerCaps;
-    uint64_t                                  linkBandwidthBps{12'500'000}; // 100 Mbps (~12.5 MB/s)
-    uint64_t                                  baseRttUs{1000};              // 1.0 ms base network latency
-    mutable std::mutex                        mu;
+    uint64_t linkBandwidthBps{12'500'000}; // 100 Mbps (~12.5 MB/s)
+    uint64_t baseRttUs{1000};              // 1.0 ms base network latency
+    mutable std::mutex mu;
 
     static uint64_t makeResKey(uint32_t w, uint32_t h) noexcept {
         return (static_cast<uint64_t>(w) << 32) | static_cast<uint64_t>(h);
@@ -37,19 +38,47 @@ struct JobScheduler::Impl {
 };
 
 JobScheduler::JobScheduler() : m_impl(std::make_unique<Impl>()) {}
-JobScheduler::~JobScheduler() { stop(); }
+JobScheduler::~JobScheduler() {
+    stop();
+}
 
 void JobScheduler::setLocalExecutor(task_runtime::LocalExecutor exec) {
-    m_impl->queue.setLocalExecutor(std::move(exec));
+    auto wrapped = [this, userExec = std::move(exec)](const protocol::TaskRequest& req) {
+        auto start = std::chrono::steady_clock::now();
+        auto result = userExec(req);
+        auto end = std::chrono::steady_clock::now();
+        uint64_t totalUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        uint64_t gpuUs = (result.gpuUs > 0) ? result.gpuUs : totalUs;
+        this->recordLocalSuccess(req.type, req.width, req.height, totalUs, req.input.size());
+        m_impl->costModel.recordLocalSuccess(req.type, req.width, req.height, gpuUs, totalUs);
+        return result;
+    };
+    m_impl->queue.setLocalExecutor(std::move(wrapped));
 }
 
 void JobScheduler::setRemoteExecutor(task_runtime::RemoteExecutor exec) {
-    m_impl->queue.setRemoteExecutor(std::move(exec));
+    auto wrapped = [this, userExec = std::move(exec)](const protocol::TaskRequest& req) {
+        auto start = std::chrono::steady_clock::now();
+        auto result = userExec(req);
+        auto end = std::chrono::steady_clock::now();
+        uint64_t totalUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+        if (result.status == protocol::TaskStatus::Ok) {
+            uint64_t netUs = (totalUs > result.gpuUs) ? (totalUs - result.gpuUs) : 1000;
+            this->recordRemoteSuccess(req.type, req.width, req.height, result.gpuUs, netUs, req.input.size(),
+                                      result.output.size());
+        } else {
+            this->recordRemoteFailure();
+        }
+        return result;
+    };
+    m_impl->queue.setRemoteExecutor(std::move(wrapped));
 }
 
 void JobScheduler::setWorkerCapabilities(const protocol::WorkerCapabilities& caps) {
     std::lock_guard<std::mutex> lk(m_impl->mu);
     m_impl->workerCaps = caps;
+    m_impl->costModel.setWorkerCapabilities(caps);
 }
 
 void JobScheduler::start(uint32_t workerThreads) {
@@ -63,6 +92,7 @@ void JobScheduler::stop() {
 void JobScheduler::setLinkBandwidthBps(uint64_t bytesPerSec) {
     std::lock_guard<std::mutex> lk(m_impl->mu);
     m_impl->linkBandwidthBps = (bytesPerSec > 0) ? bytesPerSec : 12'500'000;
+    m_impl->costModel.setLinkBandwidthBps(m_impl->linkBandwidthBps);
 }
 
 uint64_t JobScheduler::linkBandwidthBps() const noexcept {
@@ -73,6 +103,7 @@ uint64_t JobScheduler::linkBandwidthBps() const noexcept {
 void JobScheduler::setBaseRttUs(uint64_t rttUs) {
     std::lock_guard<std::mutex> lk(m_impl->mu);
     m_impl->baseRttUs = rttUs;
+    m_impl->costModel.setBaseRttUs(rttUs);
 }
 
 uint64_t JobScheduler::baseRttUs() const noexcept {
@@ -86,9 +117,18 @@ double JobScheduler::estimateRemoteTurnaroundUs(uint32_t width, uint32_t height,
         payloadBytes = static_cast<uint64_t>(width) * height * 4;
     }
 
-    double transferUs = (static_cast<double>(payloadBytes * 2) /
-                         static_cast<double>(m_impl->linkBandwidthBps)) * 1'000'000.0
-                        + static_cast<double>(m_impl->baseRttUs);
+    auto eval =
+        m_impl->costModel.evaluateStrategies(protocol::TaskType::Blur, width, height, static_cast<size_t>(payloadBytes),
+                                             0, 0, m_impl->breaker.allowRequest());
+    for (const auto& s : eval.evaluatedStrategies) {
+        if (s.strategy == ExecutionStrategy::WorkerOnly && s.isEligible) {
+            return s.breakdown.totalTurnaroundUs;
+        }
+    }
+
+    double transferUs =
+        (static_cast<double>(payloadBytes * 2) / static_cast<double>(m_impl->linkBandwidthBps)) * 1'000'000.0 +
+        static_cast<double>(m_impl->baseRttUs);
 
     uint64_t key = Impl::makeResKey(width, height);
     auto it = m_impl->resMap.find(key);
@@ -104,68 +144,45 @@ double JobScheduler::estimateRemoteTurnaroundUs(uint32_t width, uint32_t height,
     return transferUs + estGpuUs;
 }
 
-task_runtime::ExecutionSite
-JobScheduler::decide(const protocol::TaskRequest& req) const noexcept {
+WorkloadCostModel& JobScheduler::costModel() noexcept {
+    return m_impl->costModel;
+}
+
+const WorkloadCostModel& JobScheduler::costModel() const noexcept {
+    return m_impl->costModel;
+}
+
+MultiStrategyComparison JobScheduler::evaluateStrategies(const protocol::TaskRequest& req, uint32_t batchSize) const {
+    std::lock_guard<std::mutex> lk(m_impl->mu);
+    bool remoteOk = m_impl->breaker.allowRequest();
+    return m_impl->costModel.evaluateStrategies(req, m_impl->queue.pendingCount(), 0, remoteOk, batchSize);
+}
+
+task_runtime::ExecutionSite JobScheduler::decide(const protocol::TaskRequest& req) const noexcept {
     std::lock_guard<std::mutex> lk(m_impl->mu);
 
-    // Look up resolution-specific metrics
-    uint64_t key = Impl::makeResKey(req.width, req.height);
-    auto it = m_impl->resMap.find(key);
-    if (it == m_impl->resMap.end()) {
-        // Cold start for this resolution: probe local first to establish ground truth
-        return task_runtime::ExecutionSite::Local;
-    }
+    bool remoteOk = m_impl->breaker.allowRequest();
+    uint32_t pending = m_impl->queue.pendingCount();
 
-    const auto& rm = it->second;
-    if (rm.localSamples == 0) {
-        return task_runtime::ExecutionSite::Local;
-    }
+    // Workload-aware multi-strategy evaluation
+    auto comparison = m_impl->costModel.evaluateStrategies(req, pending, 0, remoteOk);
 
-    // ── Analytical Link Constraint Check (Priority 1) ────────────────────────
-    // Transmitting input payload to worker and returning output: 2x payload bytes
-    uint64_t payloadBytes = req.input.size();
-    if (payloadBytes == 0) {
-        payloadBytes = static_cast<uint64_t>(req.width) * req.height * 4;
-    }
-
-    double estTransferUs = (static_cast<double>(payloadBytes * 2) /
-                            static_cast<double>(m_impl->linkBandwidthBps)) * 1'000'000.0
-                           + static_cast<double>(m_impl->baseRttUs);
-
-    // If network transfer ALONE exceeds local GPU execution time,
-    // remote offloading is mathematically impossible to be faster on this link.
-    // Avoid probing remote or stalling the pipeline!
-    if (estTransferUs >= rm.emaLocalTotalUs * 0.95) {
-        return task_runtime::ExecutionSite::Local;
-    }
-
-    if (rm.remoteSamples == 0) {
-        // Network transfer is small enough that remote execution is physically plausible:
-        // probe remote once to establish ground truth for this resolution
+    // If optimal strategy is WorkerOnly and not falling back to local
+    if (comparison.optimalStrategy == ExecutionStrategy::WorkerOnly && !comparison.isLocalFallback) {
         return task_runtime::ExecutionSite::Remote;
     }
 
-    // Both local and remote have measured samples:
-    // Compare end-to-end estimated turnaround times
-    double estimatedRemote = rm.emaRemoteGpuUs + rm.emaNetworkRttUs;
-    double estimatedLocal  = rm.emaLocalTotalUs;
-
-    return (estimatedRemote < estimatedLocal)
-               ? task_runtime::ExecutionSite::Remote
-               : task_runtime::ExecutionSite::Local;
+    return task_runtime::ExecutionSite::Local;
 }
 
-task_runtime::JobHandle
-JobScheduler::submit(protocol::TaskRequest req,
-                     std::optional<task_runtime::ExecutionSite> forceSite) {
-    task_runtime::ExecutionSite site =
-        forceSite.has_value() ? *forceSite : decide(req);
+task_runtime::JobHandle JobScheduler::submit(protocol::TaskRequest req,
+                                             std::optional<task_runtime::ExecutionSite> forceSite) {
+    task_runtime::ExecutionSite site = forceSite.has_value() ? *forceSite : decide(req);
 
     // Pre-dispatch capability check for remote
     if (site == task_runtime::ExecutionSite::Remote && !forceSite.has_value()) {
         std::lock_guard<std::mutex> lk(m_impl->mu);
-        if (m_impl->workerCaps.has_value() &&
-            !m_impl->workerCaps->supportsTask(req.type, req.width, req.height)) {
+        if (m_impl->workerCaps.has_value() && !m_impl->workerCaps->supportsTask(req.type, req.width, req.height)) {
             site = task_runtime::ExecutionSite::Local;
             ++m_impl->metrics.fallbackCount;
         }
@@ -193,32 +210,38 @@ JobScheduler::submit(protocol::TaskRequest req,
 }
 
 void JobScheduler::recordRemoteSuccess(uint64_t remoteGpuUs, uint64_t networkUs) {
-    recordRemoteSuccess(0, 0, remoteGpuUs, networkUs);
+    recordRemoteSuccess(protocol::TaskType::Blur, 0, 0, remoteGpuUs, networkUs);
 }
 
-void JobScheduler::recordRemoteSuccess(uint32_t width, uint32_t height,
-                                       uint64_t remoteGpuUs, uint64_t networkUs) {
+void JobScheduler::recordRemoteSuccess(uint32_t width, uint32_t height, uint64_t remoteGpuUs, uint64_t networkUs) {
+    recordRemoteSuccess(protocol::TaskType::Blur, width, height, remoteGpuUs, networkUs);
+}
+
+void JobScheduler::recordRemoteSuccess(protocol::TaskType type, uint32_t width, uint32_t height, uint64_t remoteGpuUs,
+                                       uint64_t networkUs, size_t uncompressedBytes, size_t compressedBytes) {
     m_impl->breaker.recordSuccess();
     std::lock_guard<std::mutex> lk(m_impl->mu);
-    m_impl->metrics.emaRemoteUs  = emaUpdate(m_impl->metrics.emaRemoteUs,
-                                              static_cast<double>(remoteGpuUs));
-    m_impl->metrics.emaNetworkUs = emaUpdate(m_impl->metrics.emaNetworkUs,
-                                              static_cast<double>(networkUs));
+    m_impl->metrics.emaRemoteUs = emaUpdate(m_impl->metrics.emaRemoteUs, static_cast<double>(remoteGpuUs));
+    m_impl->metrics.emaNetworkUs = emaUpdate(m_impl->metrics.emaNetworkUs, static_cast<double>(networkUs));
     ++m_impl->metrics.remoteSamples;
 
     if (width > 0 && height > 0) {
         uint64_t key = Impl::makeResKey(width, height);
         auto& rm = m_impl->resMap[key];
-        rm.emaRemoteGpuUs  = emaUpdate(rm.emaRemoteGpuUs, static_cast<double>(remoteGpuUs));
+        rm.emaRemoteGpuUs = emaUpdate(rm.emaRemoteGpuUs, static_cast<double>(remoteGpuUs));
         rm.emaNetworkRttUs = emaUpdate(rm.emaNetworkRttUs, static_cast<double>(networkUs));
         ++rm.remoteSamples;
 
         if (networkUs > 500) {
             double totalBytes = static_cast<double>(static_cast<uint64_t>(width) * height * 4 * 2);
             double measuredBps = (totalBytes / static_cast<double>(networkUs)) * 1'000'000.0;
-            m_impl->linkBandwidthBps = static_cast<uint64_t>(
-                emaUpdate(static_cast<double>(m_impl->linkBandwidthBps), measuredBps));
+            m_impl->linkBandwidthBps =
+                static_cast<uint64_t>(emaUpdate(static_cast<double>(m_impl->linkBandwidthBps), measuredBps));
+            m_impl->costModel.setLinkBandwidthBps(m_impl->linkBandwidthBps);
         }
+
+        m_impl->costModel.recordRemoteSuccess(type, width, height, remoteGpuUs, networkUs, remoteGpuUs + networkUs,
+                                              uncompressedBytes, compressedBytes);
     }
 }
 
@@ -227,16 +250,18 @@ void JobScheduler::recordRemoteFailure() {
 }
 
 void JobScheduler::recordLocalSuccess(uint64_t localTotalUs, uint64_t payloadBytes) {
-    recordLocalSuccess(0, 0, localTotalUs, payloadBytes);
+    recordLocalSuccess(protocol::TaskType::Blur, 0, 0, localTotalUs, payloadBytes);
 }
 
-void JobScheduler::recordLocalSuccess(uint32_t width, uint32_t height,
-                                      uint64_t localTotalUs, uint64_t payloadBytes) {
+void JobScheduler::recordLocalSuccess(uint32_t width, uint32_t height, uint64_t localTotalUs, uint64_t payloadBytes) {
+    recordLocalSuccess(protocol::TaskType::Blur, width, height, localTotalUs, payloadBytes);
+}
+
+void JobScheduler::recordLocalSuccess(protocol::TaskType type, uint32_t width, uint32_t height, uint64_t localTotalUs,
+                                      uint64_t payloadBytes) {
     std::lock_guard<std::mutex> lk(m_impl->mu);
-    m_impl->metrics.emaLocalUs   = emaUpdate(m_impl->metrics.emaLocalUs,
-                                              static_cast<double>(localTotalUs));
-    m_impl->metrics.emaPayloadKb = emaUpdate(m_impl->metrics.emaPayloadKb,
-                                              static_cast<double>(payloadBytes) / 1024.0);
+    m_impl->metrics.emaLocalUs = emaUpdate(m_impl->metrics.emaLocalUs, static_cast<double>(localTotalUs));
+    m_impl->metrics.emaPayloadKb = emaUpdate(m_impl->metrics.emaPayloadKb, static_cast<double>(payloadBytes) / 1024.0);
     ++m_impl->metrics.localSamples;
 
     if (width > 0 && height > 0) {
@@ -244,6 +269,8 @@ void JobScheduler::recordLocalSuccess(uint32_t width, uint32_t height,
         auto& rm = m_impl->resMap[key];
         rm.emaLocalTotalUs = emaUpdate(rm.emaLocalTotalUs, static_cast<double>(localTotalUs));
         ++rm.localSamples;
+
+        m_impl->costModel.recordLocalSuccess(type, width, height, localTotalUs, localTotalUs);
     }
 }
 

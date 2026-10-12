@@ -2,6 +2,7 @@ add_executable(dgpu_host
     main.cpp
     host_server.cpp
     job_scheduler.cpp
+    workload_cost_model.cpp
     frame_compositor.cpp
     workload_partitioner.cpp
     statistical_validator.cpp

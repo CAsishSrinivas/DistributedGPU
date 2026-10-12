@@ -2,6 +2,8 @@ add_executable(dgpu_game_adapter
     main.cpp
     d3d12_game_hook.cpp
     ../host/job_scheduler.cpp
+    ../host/workload_cost_model.cpp
+    ../host/workload_partitioner.cpp
     ../host/frame_compositor.cpp
 )
 
@@ -28,6 +30,8 @@ if (WIN32)
         dxgi.def
         d3d12_game_hook.cpp
         ../host/job_scheduler.cpp
+        ../host/workload_cost_model.cpp
+        ../host/workload_partitioner.cpp
         ../host/frame_compositor.cpp
     )
 
