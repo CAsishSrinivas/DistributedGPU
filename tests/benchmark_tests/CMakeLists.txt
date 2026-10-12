@@ -17,8 +17,13 @@ add_executable(test_partitioner
     ../../apps/host/workload_cost_model.cpp
     ../../apps/host/frame_compositor.cpp
 )
-target_include_directories(test_partitioner PRIVATE ../../apps/host)
-target_link_libraries(test_partitioner PRIVATE dgpu_protocol)
+target_include_directories(test_partitioner PRIVATE ../../apps/host ../.. ../../libs)
+target_link_libraries(test_partitioner PRIVATE
+    dgpu_compile_options
+    dgpu_protocol
+    dgpu_telemetry
+    $<$<BOOL:${D3D12_AVAILABLE}>:dgpu_d3d12>
+)
 add_test(NAME partitioner_tests COMMAND test_partitioner)
 
 add_executable(test_cost_model

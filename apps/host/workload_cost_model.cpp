@@ -310,8 +310,10 @@ MultiStrategyComparison WorkloadCostModel::evaluateStrategies(protocol::TaskType
         // Evaluate candidate partition split ratio using WorkloadPartitioner
         PartitionDecision partDecision = WorkloadPartitioner::calculateOptimalDecision(
             width, height, hostGpuUs + hostUploadUs + hostReadbackUs, workerGpuUs + workerUploadUs + workerReadbackUs,
-            m_impl->linkBandwidthBps, m_impl->baseRttUs, compRatioSend, splitUs, stitchUs, compRatioRecv, 9,
-            compCpuUsPerByte, decompCpuUsPerByte);
+            m_impl->linkBandwidthBps, m_impl->baseRttUs, compRatioSend, splitUs, stitchUs, compRatioRecv,
+            WorkloadPartitioner::getApronRadiusForTask(type),
+            compCpuUsPerByte, decompCpuUsPerByte,
+            type, &WorkloadPartitioner::globalApronCache());
 
         evalDist.spatialSplitRatio = partDecision.splitRatio;
 

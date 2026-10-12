@@ -6,10 +6,17 @@
 #include "statistical_validator.hpp"
 #include "batch_scheduler.hpp"
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstring>
 #include <iostream>
 #include <numeric>
 #include <vector>
+
+#if defined(D3D12_AVAILABLE) && D3D12_AVAILABLE
+#include "d3d12/pipelined_gpu_executor.hpp"
+#endif
 
 int main() {
     using namespace dgpu;
@@ -80,6 +87,7 @@ int main() {
     // Verify every single byte matches the original input image exactly
     bool exactMatch = (stitched == fullReq.input);
     assert(exactMatch);
+    (void)exactMatch;
     std::cout << "  [PASS] Apron discard and core region stitching identity verified (exact byte match)\n";
 
     // ── Test 3: Asymmetric 60/40 Split Ratio ─────────────────────────────────
@@ -146,6 +154,8 @@ int main() {
     double tDistFast = 14.50; // Distributed faster than best GPU
     double speedupSub1 = tFastest / tDistSlow;
     double speedupSup1 = tFastest / tDistFast;
+    (void)speedupSub1;
+    (void)speedupSup1;
     assert(speedupSub1 < 1.0); // Correctly flags distributed as slower
     assert(speedupSup1 > 1.0); // Correctly flags distributed as faster
     // ── Test 8: Statistical Paired Difference & Confidence Interval ──────────
@@ -214,6 +224,254 @@ int main() {
     std::cout << "  [PASS] Dynamic work-stealing completed 24 tasks: Host = "
               << dynamicRes.hostTasksExecuted << ", Worker = " << dynamicRes.workerTasksExecuted
               << " (" << dynamicRes.throughputTasksPerSec << " tasks/sec)\n";
+
+    // ── Test 10: ApronCache Direct Operations (Phase 2.5) ─────────────────────
+    ApronCache apronCache;
+    assert(apronCache.size() == 0);
+    auto miss = apronCache.lookupAlpha(protocol::TaskType::Blur, 1024, 1024, 12'500'000);
+    assert(!miss.has_value());
+    assert(apronCache.stats().misses == 1);
+
+    apronCache.put(protocol::TaskType::Blur, 1024, 1024, 12'500'000, 0.65f, 9, 25000.0, 30000.0, 35000.0);
+    assert(apronCache.size() == 1);
+    auto hit = apronCache.lookupAlpha(protocol::TaskType::Blur, 1024, 1024, 12'500'000);
+    assert(hit.has_value() && hit.value() == 0.65f);
+    assert(apronCache.stats().hits == 1);
+
+    auto entry = apronCache.getEntry(protocol::TaskType::Blur, 1024, 1024, 12'500'000);
+    assert(entry.has_value());
+    assert(entry->apronRadius == 9);
+    assert(entry->calibratedAlpha == 0.65f);
+    std::cout << "  [PASS] ApronCache lookup, store, and statistics verified\n";
+
+    // ── Test 11: Dynamic Load Adaptation (Fluctuating Worker Latency) ────────
+    apronCache.put(protocol::TaskType::Blur, 512, 512, 125'000'000, 0.50f, 9, 10000.0, 10000.0, 12000.0);
+
+    // Scenario A: Remote congestion (Local 10ms, Remote 25ms -> remote is bottleneck)
+    float adaptedAlpha = 0.50f;
+    for (int i = 0; i < 5; ++i) {
+        adaptedAlpha = apronCache.recordFeedback(
+            protocol::TaskType::Blur, 512, 512, 125'000'000, 10'000.0, 25'000.0, 27'000.0, 0.20f);
+    }
+    assert(adaptedAlpha > 0.50f);
+    std::cout << "  [PASS] Remote congestion adaptation: alpha shifted from 0.50 to "
+              << adaptedAlpha << " (allocating more work locally)\n";
+
+    // Scenario B: Local bottleneck (Local 25ms, Remote 8ms -> local is bottleneck)
+    for (int i = 0; i < 10; ++i) {
+        adaptedAlpha = apronCache.recordFeedback(
+            protocol::TaskType::Blur, 512, 512, 125'000'000, 25'000.0, 8'000.0, 26'000.0, 0.20f);
+    }
+    assert(adaptedAlpha < 0.50f);
+    std::cout << "  [PASS] Local bottleneck adaptation: alpha shifted down to "
+              << adaptedAlpha << " (offloading more work remotely)\n";
+
+    // ── Test 12: Dynamic Halo Apron Sizing by TaskType ───────────────────────
+    assert(WorkloadPartitioner::getApronRadiusForTask(protocol::TaskType::EdgeDetection) == 1);
+    assert(WorkloadPartitioner::getApronRadiusForTask(protocol::TaskType::Blur) == 9);
+    assert(WorkloadPartitioner::getApronRadiusForTask(protocol::TaskType::Blur, 5) == 5);
+
+    protocol::TaskRequest edgeReq = fullReq;
+    edgeReq.type = protocol::TaskType::EdgeDetection;
+    auto [edge0, edge1] = WorkloadPartitioner::createSlabPartitions(edgeReq, 0.50f, 0); // 0 = auto
+    assert(edge0.apronBottom == 1);
+    assert(edge1.apronTop == 1);
+
+    protocol::TaskRequest blurReq = fullReq;
+    blurReq.type = protocol::TaskType::Blur;
+    auto [blur0, blur1] = WorkloadPartitioner::createSlabPartitions(blurReq, 0.50f, 0); // 0 = auto
+    assert(blur0.apronBottom == 9);
+    assert(blur1.apronTop == 9);
+    std::cout << "  [PASS] Dynamic kernel apron sizing verified: EdgeDetection = 1 row, Blur = 9 rows\n";
+
+    // Helper: CPU Sobel convolution matching exact discrete kernel
+    auto applyCpuSobel = [](const std::vector<std::byte>& inBuf, uint32_t w, uint32_t h) {
+        std::vector<std::byte> outBuf(static_cast<size_t>(w) * h * 4);
+        auto loadLuma = [&](int x, int y) -> float {
+            x = std::clamp(x, 0, static_cast<int>(w) - 1);
+            y = std::clamp(y, 0, static_cast<int>(h) - 1);
+            size_t idx = (static_cast<size_t>(y) * w + x) * 4;
+            float r = static_cast<float>(static_cast<uint8_t>(inBuf[idx + 0])) / 255.0f;
+            float g = static_cast<float>(static_cast<uint8_t>(inBuf[idx + 1])) / 255.0f;
+            float b = static_cast<float>(static_cast<uint8_t>(inBuf[idx + 2])) / 255.0f;
+            return 0.299f * r + 0.587f * g + 0.114f * b;
+        };
+
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                int ix = static_cast<int>(x);
+                int iy = static_cast<int>(y);
+                float gx = -loadLuma(ix-1, iy-1) - 2.0f*loadLuma(ix-1, iy) - loadLuma(ix-1, iy+1)
+                           +loadLuma(ix+1, iy-1) + 2.0f*loadLuma(ix+1, iy) + loadLuma(ix+1, iy+1);
+                float gy = -loadLuma(ix-1, iy-1) - 2.0f*loadLuma(ix, iy-1) - loadLuma(ix+1, iy-1)
+                           +loadLuma(ix-1, iy+1) + 2.0f*loadLuma(ix, iy+1) + loadLuma(ix+1, iy+1);
+                float mag = std::clamp(std::sqrt(gx*gx + gy*gy), 0.0f, 1.0f);
+                uint8_t val = static_cast<uint8_t>(mag * 255.0f);
+                size_t outIdx = (static_cast<size_t>(y) * w + x) * 4;
+                outBuf[outIdx + 0] = static_cast<std::byte>(val);
+                outBuf[outIdx + 1] = static_cast<std::byte>(val);
+                outBuf[outIdx + 2] = static_cast<std::byte>(val);
+                outBuf[outIdx + 3] = static_cast<std::byte>(255);
+            }
+        }
+        return outBuf;
+    };
+
+    // Helper: CPU box blur convolution
+    auto applyCpuBoxBlur = [](const std::vector<std::byte>& inBuf, uint32_t w, uint32_t h, int rad) {
+        std::vector<std::byte> outBuf(static_cast<size_t>(w) * h * 4);
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                float sumR = 0, sumG = 0, sumB = 0;
+                int count = 0;
+                for (int dy = -rad; dy <= rad; ++dy) {
+                    int sy = std::clamp(static_cast<int>(y) + dy, 0, static_cast<int>(h) - 1);
+                    for (int dx = -rad; dx <= rad; ++dx) {
+                        int sx = std::clamp(static_cast<int>(x) + dx, 0, static_cast<int>(w) - 1);
+                        size_t idx = (static_cast<size_t>(sy) * w + sx) * 4;
+                        sumR += static_cast<uint8_t>(inBuf[idx + 0]);
+                        sumG += static_cast<uint8_t>(inBuf[idx + 1]);
+                        sumB += static_cast<uint8_t>(inBuf[idx + 2]);
+                        ++count;
+                    }
+                }
+                size_t outIdx = (static_cast<size_t>(y) * w + x) * 4;
+                outBuf[outIdx + 0] = static_cast<std::byte>(static_cast<uint8_t>(sumR / count));
+                outBuf[outIdx + 1] = static_cast<std::byte>(static_cast<uint8_t>(sumG / count));
+                outBuf[outIdx + 2] = static_cast<std::byte>(static_cast<uint8_t>(sumB / count));
+                outBuf[outIdx + 3] = static_cast<std::byte>(255);
+            }
+        }
+        return outBuf;
+    };
+
+    // ── Test 13: Numerical Seam Invariance & Bit-Exact Reconstruction (L1 == 0.0)
+    // 13A: Sobel Edge Detection with 1-pixel apron
+    auto groundTruthSobel = applyCpuSobel(fullReq.input, width, height);
+    auto [sobelPart0, sobelPart1] = WorkloadPartitioner::createSlabPartitions(edgeReq, 0.50f, 1);
+
+    protocol::TaskResult sobelRes0, sobelRes1;
+    sobelRes0.output = applyCpuSobel(sobelPart0.request.input, sobelPart0.request.width, sobelPart0.request.height);
+    sobelRes1.output = applyCpuSobel(sobelPart1.request.input, sobelPart1.request.width, sobelPart1.request.height);
+
+    auto stitchedSobel = WorkloadPartitioner::stitchSlabPartitions(sobelPart0, sobelRes0, sobelPart1, sobelRes1);
+    assert(stitchedSobel.size() == groundTruthSobel.size());
+
+    double l1Sobel = 0.0;
+    for (size_t i = 0; i < groundTruthSobel.size(); ++i) {
+        l1Sobel += std::abs(static_cast<double>(static_cast<uint8_t>(stitchedSobel[i])) -
+                            static_cast<double>(static_cast<uint8_t>(groundTruthSobel[i])));
+    }
+    assert(l1Sobel == 0.0);
+    std::cout << "  [PASS] Sobel edge detection numerical seam invariance: L1 norm = " << l1Sobel
+              << " (bit-exact match to unpartitioned ground truth)\n";
+
+    // 13B: Verification that omitting apron introduces seam boundary error
+    auto [noApron0, noApron1] = WorkloadPartitioner::createSlabPartitions(edgeReq, 0.50f, 1);
+    noApron0.apronBottom = 0;
+    noApron0.inputHeight = noApron0.coreHeight;
+    noApron0.request.height = noApron0.coreHeight;
+    noApron0.request.input.resize(static_cast<size_t>(noApron0.coreHeight) * width * 4);
+    std::memcpy(noApron0.request.input.data(), fullReq.input.data(), noApron0.request.input.size());
+
+    noApron1.apronTop = 0;
+    noApron1.inputHeight = noApron1.coreHeight;
+    noApron1.request.height = noApron1.coreHeight;
+    noApron1.request.input.resize(static_cast<size_t>(noApron1.coreHeight) * width * 4);
+    std::memcpy(noApron1.request.input.data(), fullReq.input.data() + (static_cast<size_t>(noApron1.coreY) * width * 4), noApron1.request.input.size());
+
+    protocol::TaskResult noApronRes0, noApronRes1;
+    noApronRes0.output = applyCpuSobel(noApron0.request.input, noApron0.request.width, noApron0.request.height);
+    noApronRes1.output = applyCpuSobel(noApron1.request.input, noApron1.request.width, noApron1.request.height);
+    auto stitchedNoApron = WorkloadPartitioner::stitchSlabPartitions(noApron0, noApronRes0, noApron1, noApronRes1);
+
+    double l1NoApron = 0.0;
+    for (size_t i = 0; i < groundTruthSobel.size(); ++i) {
+        l1NoApron += std::abs(static_cast<double>(static_cast<uint8_t>(stitchedNoApron[i])) -
+                              static_cast<double>(static_cast<uint8_t>(groundTruthSobel[i])));
+    }
+    assert(l1NoApron > 0.0);
+    std::cout << "  [PASS] Omitting apron yields seam artifact error: L1 norm = " << l1NoApron
+              << " (mathematically confirms halo necessity)\n";
+
+    // 13C: Blur Convolution with 5-pixel apron
+    auto groundTruthBlur = applyCpuBoxBlur(fullReq.input, width, height, 5);
+    auto [blurPart0, blurPart1] = WorkloadPartitioner::createSlabPartitions(blurReq, 0.50f, 5);
+    protocol::TaskResult blurRes0, blurRes1;
+    blurRes0.output = applyCpuBoxBlur(blurPart0.request.input, blurPart0.request.width, blurPart0.request.height, 5);
+    blurRes1.output = applyCpuBoxBlur(blurPart1.request.input, blurPart1.request.width, blurPart1.request.height, 5);
+    auto stitchedBlur = WorkloadPartitioner::stitchSlabPartitions(blurPart0, blurRes0, blurPart1, blurRes1);
+
+    double l1Blur = 0.0;
+    for (size_t i = 0; i < groundTruthBlur.size(); ++i) {
+        l1Blur += std::abs(static_cast<double>(static_cast<uint8_t>(stitchedBlur[i])) -
+                           static_cast<double>(static_cast<uint8_t>(groundTruthBlur[i])));
+    }
+    assert(l1Blur == 0.0);
+    std::cout << "  [PASS] Blur convolution numerical seam invariance: L1 norm = " << l1Blur
+              << " (bit-exact reconstruction, zero seam artifacts)\n";
+
+    // ── Test 14: Hardware D3D12 Seam Invariance (if available) ───────────────
+#if defined(D3D12_AVAILABLE) && D3D12_AVAILABLE
+    {
+        d3d12::PipelinedGpuExecutor executor;
+        if (executor.initialize(2)) {
+            // Full frame execution
+            assert(executor.submitAsync(edgeReq, 0));
+            auto hwGroundTruth = executor.collect(0);
+
+            // Slab execution
+            auto [hwPart0, hwPart1] = WorkloadPartitioner::createSlabPartitions(edgeReq, 0.50f, 1);
+            assert(executor.submitAsync(hwPart0.request, 0));
+            assert(executor.submitAsync(hwPart1.request, 1));
+            auto hwRes0 = executor.collect(0);
+            auto hwRes1 = executor.collect(1);
+
+            auto hwStitched = WorkloadPartitioner::stitchSlabPartitions(hwPart0, hwRes0, hwPart1, hwRes1);
+            assert(hwStitched.size() == hwGroundTruth.output.size());
+
+            double hwL1 = 0.0;
+            for (size_t i = 0; i < hwGroundTruth.output.size(); ++i) {
+                hwL1 += std::abs(static_cast<double>(static_cast<uint8_t>(hwStitched[i])) -
+                                 static_cast<double>(static_cast<uint8_t>(hwGroundTruth.output[i])));
+            }
+            assert(hwL1 == 0.0);
+            std::cout << "  [PASS] Direct3D 12 Hardware GPU edge detection seam invariance: L1 norm = " << hwL1
+                      << " on " << executor.adapterInfo().description << "\n";
+        } else {
+            std::cout << "  [SKIP] D3D12 hardware not available, skipped D3D12 seam verification\n";
+        }
+    }
+#endif
+
+    // ── Test 15: Adaptive Partitioning vs Static 50/50 & Local-Only Sweep ────
+    const uint32_t resolutions[] = { 512, 1024, 2048 };
+    for (uint32_t res : resolutions) {
+        double localGpuUs = (static_cast<double>(res * res) / (1024.0 * 1024.0)) * 40'000.0;
+        double remoteGpuUs = localGpuUs * 1.30;
+        uint64_t bandwidth = 125'000'000;
+
+        auto adaptDec = WorkloadPartitioner::calculateOptimalDecision(
+            res, res, localGpuUs, remoteGpuUs, bandwidth, 1000, 3.0f, 300.0, 500.0, 3.0f, 9,
+            0.002, 0.0006, protocol::TaskType::Blur, &apronCache);
+
+        // Static 50/50 comparison:
+        double staticLocalH = res * 0.5;
+        double staticRemoteH = res * 0.5;
+        double staticLocalUs = staticLocalH * res * (localGpuUs / (res * res));
+        double staticRemoteUs = staticRemoteH * res * (remoteGpuUs / (res * res)) + (staticRemoteH * res * 4.0 / 3.0 / bandwidth * 1e6);
+        double staticWallUs = std::max(staticLocalUs, staticRemoteUs) + 800.0;
+
+        assert(!adaptDec.isLocalFallback);
+        assert(adaptDec.splitRatio > 0.50f);
+        assert(adaptDec.predictedWallClockUs <= staticWallUs);
+        assert(adaptDec.predictedWallClockUs < localGpuUs);
+
+        std::cout << "  [PASS] Resolution " << res << "x" << res << ": Adaptive split "
+                  << static_cast<int>(adaptDec.splitRatio * 100) << "% predicted "
+                  << adaptDec.predictedWallClockUs / 1000.0 << " ms vs Static 50/50 "
+                  << staticWallUs / 1000.0 << " ms (Local-only: " << localGpuUs / 1000.0 << " ms)\n";
+    }
 
     std::cout << "[test_partitioner] All tests passed successfully!\n";
     return 0;
