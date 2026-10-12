@@ -81,6 +81,16 @@ struct TcpConnection::Impl {
         BOOL ka = TRUE;
         setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE,
                    reinterpret_cast<const char*>(&ka), sizeof(ka));
+        // Disable Nagle algorithm for immediate frame payload transmission without jitter
+        BOOL nodelay = TRUE;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+                   reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+        // Expand socket buffer sizes to 2 MB to absorb frame bursts over Wi-Fi
+        int bufSize = 2 * 1024 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF,
+                   reinterpret_cast<const char*>(&bufSize), sizeof(bufSize));
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
+                   reinterpret_cast<const char*>(&bufSize), sizeof(bufSize));
     }
 };
 
