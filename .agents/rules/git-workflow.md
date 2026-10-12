@@ -26,11 +26,17 @@ Direct pushes to `develop` and `main` branches are **strictly forbidden**. All c
      ```bash
      git push -u origin feature/issue-<ID>-<short-description>
      ```
-   - Open a PR targeting the `develop` branch.
+   - Open a PR targeting the `develop` branch using GitHub CLI:
+     ```bash
+     gh pr create --base develop --title "..." --body "..."
+     ```
    - Reference the issue in the PR description (`Closes #<ID>`).
 
-5. **Merge & Automated Release**:
-   - Squash and merge the PR into `develop`.
-   - Once merged, the release pipeline produces/updates the `develop-latest` release (`DistributedGPU-windows-x64-develop.zip`).
-   - Merging `develop` into `main` produces the production `main-latest` release (`DistributedGPU-windows-x64-main.zip`).
-   - Any device / laptop will automatically pull the build corresponding to its active branch.
+5. **User-Only PR Review & Merge (CRITICAL RULE)**:
+   > **STRICT CONSTRAINT**: **ONLY THE HUMAN USER CAN REVIEW, MERGE, OR CLOSE A PULL REQUEST.**  
+   > The AI assistant is **STRICTLY FORBIDDEN** from running `gh pr merge`, `gh pr close`, or using the GitHub API to merge/close PRs.  
+   > Once the AI opens a PR, it must **STOP** and provide the PR link to the user.
+   - The user reviews the PR diff on GitHub.
+   - The user merges the PR (Squash and Merge) or requests changes.
+   - Once the user merges into `develop`, the release pipeline updates `develop-latest`.
+   - Merging `develop` into `main` updates the production `main-latest` release.
