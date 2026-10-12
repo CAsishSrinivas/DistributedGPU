@@ -89,11 +89,15 @@ static Message makeControl(MessageType type, uint64_t taskId = 0,
 
 Message Message::makeHello(const std::string& hostname,
                            const std::string& gpuName,
-                           uint32_t           vramMb) {
+                           uint32_t           vramMb,
+                           const WorkerCapabilities& caps) {
     HelloPayload hp;
-    hp.hostname = hostname;
-    hp.gpuName  = gpuName;
-    hp.vramMb   = vramMb;
+    hp.hostname     = hostname;
+    hp.gpuName      = gpuName;
+    hp.vramMb       = vramMb;
+    hp.capabilities = caps;
+    if (hp.capabilities.hostname.empty()) hp.capabilities.hostname = hostname;
+    if (hp.capabilities.gpuName.empty())  hp.capabilities.gpuName  = gpuName;
     auto msg = makeControl(MessageType::Hello);
     msg.payload = hp.serialise();
     msg.header.payloadSize = hton32(static_cast<uint32_t>(msg.payload.size()));
@@ -102,11 +106,15 @@ Message Message::makeHello(const std::string& hostname,
 
 Message Message::makeHelloAck(const std::string& hostname,
                               const std::string& gpuName,
-                              uint32_t           vramMb) {
+                              uint32_t           vramMb,
+                              const WorkerCapabilities& caps) {
     HelloPayload hp;
-    hp.hostname = hostname;
-    hp.gpuName  = gpuName;
-    hp.vramMb   = vramMb;
+    hp.hostname     = hostname;
+    hp.gpuName      = gpuName;
+    hp.vramMb       = vramMb;
+    hp.capabilities = caps;
+    if (hp.capabilities.hostname.empty()) hp.capabilities.hostname = hostname;
+    if (hp.capabilities.gpuName.empty())  hp.capabilities.gpuName  = gpuName;
     auto msg = makeControl(MessageType::HelloAck);
     msg.payload = hp.serialise();
     msg.header.payloadSize = hton32(static_cast<uint32_t>(msg.payload.size()));
@@ -121,6 +129,43 @@ Message Message::makePing(uint64_t taskId) { return makeControl(MessageType::Pin
 Message Message::makePong(uint64_t taskId) { return makeControl(MessageType::Pong, taskId); }
 Message Message::makeShutdown()            { return makeControl(MessageType::Shutdown); }
 
+// ─── WorkerCapabilities ───────────────────────────────────────────────────────
+
+std::vector<std::byte> WorkerCapabilities::serialise() const {
+    std::vector<std::byte> buf;
+    appendString(buf, workerId);
+    appendString(buf, hostname);
+    appendString(buf, gpuName);
+    appendPOD(buf, hton64(vramBytes));
+    appendPOD(buf, hton32(supportedTasks));
+    appendPOD(buf, hton32(maxWidth));
+    appendPOD(buf, hton32(maxHeight));
+    appendPOD(buf, hton32(maxBatchSize));
+    return buf;
+}
+
+WorkerCapabilities WorkerCapabilities::deserialise(std::span<const std::byte> data) {
+    WorkerCapabilities caps;
+    size_t off = 0;
+    caps.workerId       = readString(data, off);
+    caps.hostname       = readString(data, off);
+    caps.gpuName        = readString(data, off);
+    caps.vramBytes      = ntoh64(readPOD<uint64_t>(data, off));
+    off += sizeof(uint64_t);
+    caps.supportedTasks = ntoh32(readPOD<uint32_t>(data, off));
+    off += sizeof(uint32_t);
+    caps.maxWidth       = ntoh32(readPOD<uint32_t>(data, off));
+    off += sizeof(uint32_t);
+    caps.maxHeight      = ntoh32(readPOD<uint32_t>(data, off));
+    off += sizeof(uint32_t);
+    caps.maxBatchSize   = ntoh32(readPOD<uint32_t>(data, off));
+    off += sizeof(uint32_t);
+    if (off != data.size()) {
+        throw std::runtime_error("Malformed WorkerCapabilities: unexpected trailing bytes");
+    }
+    return caps;
+}
+
 // ─── HelloPayload ─────────────────────────────────────────────────────────────
 
 std::vector<std::byte> HelloPayload::serialise() const {
@@ -128,6 +173,19 @@ std::vector<std::byte> HelloPayload::serialise() const {
     appendString(buf, hostname);
     appendString(buf, gpuName);
     appendPOD(buf, hton32(vramMb));
+
+    // Protocol v2 capabilities extension
+    std::string wid = capabilities.workerId.empty() ? hostname : capabilities.workerId;
+    appendString(buf, wid);
+    uint64_t vb = capabilities.vramBytes;
+    if (vb == 0 && vramMb > 0) {
+        vb = static_cast<uint64_t>(vramMb) * 1024u * 1024u;
+    }
+    appendPOD(buf, hton64(vb));
+    appendPOD(buf, hton32(capabilities.supportedTasks));
+    appendPOD(buf, hton32(capabilities.maxWidth));
+    appendPOD(buf, hton32(capabilities.maxHeight));
+    appendPOD(buf, hton32(capabilities.maxBatchSize));
     return buf;
 }
 
@@ -138,6 +196,33 @@ HelloPayload HelloPayload::deserialise(std::span<const std::byte> data) {
     hp.gpuName  = readString(data, off);
     hp.vramMb   = ntoh32(readPOD<uint32_t>(data, off));
     off += sizeof(uint32_t);
+
+    hp.capabilities.hostname = hp.hostname;
+    hp.capabilities.gpuName  = hp.gpuName;
+    hp.capabilities.vramBytes = static_cast<uint64_t>(hp.vramMb) * 1024u * 1024u;
+
+    if (off < data.size()) {
+        // Protocol v2 fields present
+        hp.capabilities.workerId       = readString(data, off);
+        hp.capabilities.vramBytes      = ntoh64(readPOD<uint64_t>(data, off));
+        off += sizeof(uint64_t);
+        hp.capabilities.supportedTasks = ntoh32(readPOD<uint32_t>(data, off));
+        off += sizeof(uint32_t);
+        hp.capabilities.maxWidth       = ntoh32(readPOD<uint32_t>(data, off));
+        off += sizeof(uint32_t);
+        hp.capabilities.maxHeight      = ntoh32(readPOD<uint32_t>(data, off));
+        off += sizeof(uint32_t);
+        hp.capabilities.maxBatchSize   = ntoh32(readPOD<uint32_t>(data, off));
+        off += sizeof(uint32_t);
+    } else {
+        // Fallback defaults for Protocol v1 peers
+        hp.capabilities.workerId       = hp.hostname;
+        hp.capabilities.supportedTasks = TaskCap_All;
+        hp.capabilities.maxWidth       = 4096;
+        hp.capabilities.maxHeight      = 4096;
+        hp.capabilities.maxBatchSize   = 64;
+    }
+
     if (off != data.size()) {
         throw std::runtime_error("Malformed HelloPayload: unexpected trailing bytes");
     }

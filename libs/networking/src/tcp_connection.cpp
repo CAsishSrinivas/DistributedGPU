@@ -175,7 +175,7 @@ bool TcpConnection::receiveMessage(protocol::Message& out) {
 #else
     version = __builtin_bswap16(version);
 #endif
-    if (version != protocol::PROTO_VERSION) {
+    if (version != protocol::PROTO_VERSION && version != protocol::PROTO_VERSION_V1) {
         std::cerr << "[tcp] unsupported protocol version: " << version << '\n';
         return false;
     }
@@ -364,7 +364,11 @@ bool TaskClient::connect(const std::string& host, uint16_t port,
     if (!m_conn.connect(host, port, opts)) return false;
 
     // Handshake: send HELLO and await valid HELLO_ACK
-    auto hello = protocol::Message::makeHello("HostA", "RTX 3050", 4096);
+    protocol::WorkerCapabilities hostCaps;
+    hostCaps.hostname   = "HostA";
+    hostCaps.gpuName    = "RTX 3050";
+    hostCaps.vramBytes  = 4096ull * 1024ull * 1024ull;
+    auto hello = protocol::Message::makeHello("HostA", "RTX 3050", 4096, hostCaps);
     if (!m_conn.sendMessage(hello)) {
         m_conn.close();
         return false;
@@ -380,10 +384,23 @@ bool TaskClient::connect(const std::string& host, uint16_t port,
     uint16_t version = _byteswap_ushort(ack.header.version);
     uint16_t type    = _byteswap_ushort(ack.header.messageType);
 
-    if (magic != protocol::MAGIC || version != protocol::PROTO_VERSION ||
+    if (magic != protocol::MAGIC ||
+        (version != protocol::PROTO_VERSION && version != protocol::PROTO_VERSION_V1) ||
         type != static_cast<uint16_t>(protocol::MessageType::HelloAck)) {
         m_conn.close();
         return false;
+    }
+
+    m_hasCaps = false;
+    m_workerCaps = {};
+    try {
+        if (!ack.payload.empty()) {
+            auto hp = protocol::HelloPayload::deserialise(ack.payload);
+            m_workerCaps = std::move(hp.capabilities);
+            m_hasCaps = true;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[client] Failed to parse worker capabilities: " << e.what() << '\n';
     }
 
     return true;
@@ -391,6 +408,14 @@ bool TaskClient::connect(const std::string& host, uint16_t port,
 
 protocol::TaskResult TaskClient::submit(const protocol::TaskRequest& req) {
     std::lock_guard<std::mutex> lk(m_submitMu);
+
+    // Pre-dispatch capability & resolution validation
+    if (m_hasCaps && !m_workerCaps.supportsTask(req.type, req.width, req.height)) {
+        protocol::TaskResult err;
+        err.taskId = req.taskId;
+        err.status = protocol::TaskStatus::UnsupportedTask;
+        return err;
+    }
 
     // Build SUBMIT_TASK message
     auto payload = req.serialise();
@@ -541,7 +566,7 @@ bool TaskClient::ping() {
     uint64_t taskId  = _byteswap_uint64(pong.header.taskId);
 
     return (magic == protocol::MAGIC &&
-            version == protocol::PROTO_VERSION &&
+            (version == protocol::PROTO_VERSION || version == protocol::PROTO_VERSION_V1) &&
             type == static_cast<uint16_t>(protocol::MessageType::Pong) &&
             taskId == pingId);
 }
@@ -549,6 +574,7 @@ bool TaskClient::ping() {
 void TaskClient::disconnect() {
     std::lock_guard<std::mutex> lk(m_submitMu);
     m_conn.close();
+    m_hasCaps = false;
 }
 
 bool TaskClient::isConnected() const noexcept {
@@ -569,6 +595,16 @@ bool TaskClient::isCompressionEnabled() const noexcept {
 TaskClient::TransferMetrics TaskClient::lastTransferMetrics() const noexcept {
     std::lock_guard<std::mutex> lk(m_submitMu);
     return m_lastMetrics;
+}
+
+const protocol::WorkerCapabilities& TaskClient::capabilities() const noexcept {
+    std::lock_guard<std::mutex> lk(m_submitMu);
+    return m_workerCaps;
+}
+
+bool TaskClient::hasCapabilities() const noexcept {
+    std::lock_guard<std::mutex> lk(m_submitMu);
+    return m_hasCaps;
 }
 
 } // namespace dgpu::networking

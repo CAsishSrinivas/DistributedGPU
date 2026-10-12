@@ -130,12 +130,18 @@ public:
 
     [[nodiscard]] TransferMetrics lastTransferMetrics() const noexcept;
 
+    // Worker Registration & Capabilities (Protocol v2)
+    [[nodiscard]] const protocol::WorkerCapabilities& capabilities() const noexcept;
+    [[nodiscard]] bool hasCapabilities() const noexcept;
+
 private:
-    TcpConnection       m_conn;
-    uint64_t            m_nextTaskId{1};
-    bool                m_compressionEnabled{true};
-    TransferMetrics     m_lastMetrics;
-    mutable std::mutex  m_submitMu;
+    TcpConnection                m_conn;
+    uint64_t                     m_nextTaskId{1};
+    bool                         m_compressionEnabled{true};
+    TransferMetrics              m_lastMetrics;
+    protocol::WorkerCapabilities m_workerCaps{};
+    bool                         m_hasCaps{false};
+    mutable std::mutex           m_submitMu;
 };
 
 // ─── Winsock RAII guard ───────────────────────────────────────────────────────

@@ -26,6 +26,7 @@ struct JobScheduler::Impl {
     task_runtime::CircuitBreaker              breaker;
     SchedulerMetrics                          metrics;
     std::unordered_map<uint64_t, ResolutionMetrics> resMap;
+    std::optional<protocol::WorkerCapabilities> workerCaps;
     uint64_t                                  linkBandwidthBps{12'500'000}; // 100 Mbps (~12.5 MB/s)
     uint64_t                                  baseRttUs{1000};              // 1.0 ms base network latency
     mutable std::mutex                        mu;
@@ -44,6 +45,11 @@ void JobScheduler::setLocalExecutor(task_runtime::LocalExecutor exec) {
 
 void JobScheduler::setRemoteExecutor(task_runtime::RemoteExecutor exec) {
     m_impl->queue.setRemoteExecutor(std::move(exec));
+}
+
+void JobScheduler::setWorkerCapabilities(const protocol::WorkerCapabilities& caps) {
+    std::lock_guard<std::mutex> lk(m_impl->mu);
+    m_impl->workerCaps = caps;
 }
 
 void JobScheduler::start(uint32_t workerThreads) {
@@ -154,6 +160,16 @@ JobScheduler::submit(protocol::TaskRequest req,
                      std::optional<task_runtime::ExecutionSite> forceSite) {
     task_runtime::ExecutionSite site =
         forceSite.has_value() ? *forceSite : decide(req);
+
+    // Pre-dispatch capability check for remote
+    if (site == task_runtime::ExecutionSite::Remote && !forceSite.has_value()) {
+        std::lock_guard<std::mutex> lk(m_impl->mu);
+        if (m_impl->workerCaps.has_value() &&
+            !m_impl->workerCaps->supportsTask(req.type, req.width, req.height)) {
+            site = task_runtime::ExecutionSite::Local;
+            ++m_impl->metrics.fallbackCount;
+        }
+    }
 
     // Circuit breaker check for remote
     if (site == task_runtime::ExecutionSite::Remote) {

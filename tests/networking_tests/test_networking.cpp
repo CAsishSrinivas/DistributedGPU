@@ -11,6 +11,7 @@
 #pragma comment(lib, "Ws2_32.lib")
 
 #include "networking/tcp_connection.hpp"
+#include "networking/health_monitor.hpp"
 #include "protocol/message.hpp"
 
 #include <atomic>
@@ -246,6 +247,211 @@ static void test_large_payload() {
     std::cout << "  large-payload (1MB): PASS\n";
 }
 
+// ─── Test: worker capabilities negotiation & pre-dispatch rejection ─────────
+
+static void test_worker_capabilities_negotiation() {
+    WinsockInit wsa;
+    CHECK(wsa.ok());
+
+    WorkerCapabilities advertisedCaps;
+    advertisedCaps.workerId       = "uuid-laptop-b-1650ti";
+    advertisedCaps.hostname       = "Laptop-B";
+    advertisedCaps.gpuName        = "GTX 1650 Ti";
+    advertisedCaps.vramBytes      = 4ull * 1024ull * 1024ull * 1024ull;
+    advertisedCaps.supportedTasks = TaskCap_Blur; // Only Blur supported, NOT EdgeDetection!
+    advertisedCaps.maxWidth       = 1920;
+    advertisedCaps.maxHeight      = 1080;
+
+    TaskServer server;
+    CHECK(server.start(17782, [advertisedCaps](TcpConnection conn) {
+        // Handshake
+        Message hello;
+        if (!conn.receiveMessage(hello)) return;
+
+        Message ack = Message::makeHelloAck("Laptop-B", "GTX 1650 Ti", 4096, advertisedCaps);
+        if (!conn.sendMessage(ack)) return;
+
+        Message msg;
+        while (conn.receiveMessage(msg)) {
+            uint16_t msgType = 0;
+            std::memcpy(&msgType, &msg.header.messageType, sizeof(msgType));
+            msgType = _byteswap_ushort(msgType);
+
+            if (msgType == static_cast<uint16_t>(MessageType::Ping)) {
+                uint64_t tid = 0;
+                std::memcpy(&tid, &msg.header.taskId, sizeof(tid));
+                auto pong = Message::makePong(_byteswap_uint64(tid));
+                conn.sendMessage(pong);
+                continue;
+            }
+
+            if (msgType == static_cast<uint16_t>(MessageType::SubmitTask)) {
+                // Echo successful dummy result
+                uint64_t tid = 0;
+                std::memcpy(&tid, &msg.header.taskId, sizeof(tid));
+                tid = _byteswap_uint64(tid);
+                TaskResult res;
+                res.taskId = tid;
+                res.status = TaskStatus::Ok;
+                Message resp;
+                resp.header.magic       = _byteswap_ulong(MAGIC);
+                resp.header.version     = _byteswap_ushort(PROTO_VERSION);
+                resp.header.messageType = _byteswap_ushort(static_cast<uint16_t>(MessageType::TaskResult));
+                resp.header.taskId      = _byteswap_uint64(tid);
+                auto pl = res.serialise();
+                resp.header.payloadSize = _byteswap_ulong(static_cast<uint32_t>(pl.size()));
+                resp.header.status      = 0;
+                resp.payload            = std::move(pl);
+                conn.sendMessage(resp);
+            }
+        }
+    }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    TaskClient client;
+    CHECK(client.connect("127.0.0.1", 17782));
+    CHECK(client.hasCapabilities());
+    CHECK(client.capabilities().workerId == "uuid-laptop-b-1650ti");
+    CHECK(client.capabilities().maxWidth == 1920);
+
+    // 1. Submit supported task (Blur, 1280x720) -> should succeed
+    TaskRequest validReq;
+    validReq.taskId = 101;
+    validReq.type   = TaskType::Blur;
+    validReq.width  = 1280;
+    validReq.height = 720;
+    validReq.input.resize(1280 * 720 * 4, std::byte{0});
+    client.setCompressionEnabled(false);
+    auto res1 = client.submit(validReq);
+    CHECK(res1.status == TaskStatus::Ok);
+
+    // 2. Submit unsupported task (EdgeDetection) -> pre-dispatch rejected immediately!
+    TaskRequest unsupportedReq;
+    unsupportedReq.taskId = 102;
+    unsupportedReq.type   = TaskType::EdgeDetection;
+    unsupportedReq.width  = 1280;
+    unsupportedReq.height = 720;
+    unsupportedReq.input.resize(1280 * 720 * 4, std::byte{0});
+    auto res2 = client.submit(unsupportedReq);
+    CHECK(res2.status == TaskStatus::UnsupportedTask);
+
+    // 3. Submit oversized resolution (3840x2160 > maxWidth 1920) -> pre-dispatch rejected!
+    TaskRequest oversizedReq;
+    oversizedReq.taskId = 103;
+    oversizedReq.type   = TaskType::Blur;
+    oversizedReq.width  = 3840;
+    oversizedReq.height = 2160;
+    oversizedReq.input.resize(3840 * 2160 * 4, std::byte{0});
+    auto res3 = client.submit(oversizedReq);
+    CHECK(res3.status == TaskStatus::UnsupportedTask);
+
+    client.disconnect();
+    server.stop();
+    std::cout << "  worker-capabilities-negotiation & rejection: PASS\n";
+}
+
+// ─── Test: worker health monitor state transitions & reconnection ─────────────
+
+static void test_health_monitor_state_transitions() {
+    WinsockInit wsa;
+    CHECK(wsa.ok());
+
+    auto makeEchoHandler = []() {
+        return [](TcpConnection conn) {
+            Message msg;
+            while (conn.receiveMessage(msg)) {
+                uint16_t msgType = 0;
+                std::memcpy(&msgType, &msg.header.messageType, sizeof(msgType));
+                msgType = _byteswap_ushort(msgType);
+                if (msgType == static_cast<uint16_t>(MessageType::Hello)) {
+                    auto ack = Message::makeHelloAck("WorkerB", "MockGPU", 4096);
+                    conn.sendMessage(ack);
+                } else if (msgType == static_cast<uint16_t>(MessageType::Ping)) {
+                    uint64_t tid = 0;
+                    std::memcpy(&tid, &msg.header.taskId, sizeof(tid));
+                    auto pong = Message::makePong(_byteswap_uint64(tid));
+                    conn.sendMessage(pong);
+                }
+            }
+        };
+    };
+
+    auto server = std::make_unique<TaskServer>();
+    CHECK(server->start(17783, makeEchoHandler()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    TaskClient client;
+    CHECK(client.connect("127.0.0.1", 17783));
+
+    HealthMonitorConfig cfg;
+    cfg.heartbeatIntervalMs = 50;  // Fast heartbeat for test
+    cfg.heartbeatTimeoutMs  = 100;
+    cfg.suspectThreshold    = 1;
+    cfg.disconnectThreshold = 2;
+    cfg.initialBackoffMs    = 50;
+    cfg.maxBackoffMs        = 200;
+    cfg.autoReconnect       = true;
+
+    std::vector<WorkerHealthState> history;
+    std::mutex histMu;
+
+    WorkerHealthMonitor monitor(client, "127.0.0.1", 17783, cfg);
+    monitor.setStateCallback([&](WorkerHealthState /*oldS*/, WorkerHealthState newS) {
+        std::lock_guard<std::mutex> lk(histMu);
+        history.push_back(newS);
+    });
+
+    monitor.start();
+    CHECK(monitor.isHealthy());
+
+    // Allow a few successful heartbeats
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    CHECK(monitor.successfulHeartbeats() > 0);
+
+    // Stop server to simulate worker crash
+    server->stop();
+
+    // Wait for monitor to transition Healthy -> Suspect -> Disconnected -> Recovering
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+    {
+        std::lock_guard<std::mutex> lk(histMu);
+        bool sawSuspect      = false;
+        bool sawDisconnected = false;
+        bool sawRecovering   = false;
+        for (auto s : history) {
+            if (s == WorkerHealthState::Suspect)      sawSuspect = true;
+            if (s == WorkerHealthState::Disconnected) sawDisconnected = true;
+            if (s == WorkerHealthState::Recovering)   sawRecovering = true;
+        }
+        CHECK(sawSuspect);
+        CHECK(sawDisconnected);
+        CHECK(sawRecovering);
+    }
+
+    // Now restart worker server on same port — monitor should auto-reconnect!
+    server = std::make_unique<TaskServer>();
+    CHECK(server->start(17783, makeEchoHandler()));
+
+    // Wait for auto-reconnect back to Healthy
+    bool reconnected = false;
+    for (int i = 0; i < 60; ++i) {
+        if (monitor.isHealthy()) {
+            reconnected = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+
+    CHECK(reconnected);
+    CHECK(monitor.reconnectAttempts() > 0);
+
+    monitor.stop();
+    client.disconnect();
+    server->stop();
+    std::cout << "  health-monitor state transitions & auto-recovery: PASS\n";
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 int main() {
@@ -255,6 +461,8 @@ int main() {
     test_oversized_payload();
     test_truncated_stream();
     test_large_payload();
+    test_worker_capabilities_negotiation();
+    test_health_monitor_state_transitions();
     std::cout << g_passed << " passed, " << g_failed << " failed.\n";
     return g_failed == 0 ? 0 : 1;
 }

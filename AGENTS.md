@@ -3,8 +3,10 @@
 ## 1. Git Workflow & PR Merge Constraint
 
 - **Direct Pushes Forbidden**: NEVER push directly to `develop` or `main`.
+- **Permanent Base Branches**: Base branches `main` and `develop` are permanent and CAN NEVER BE DELETED.
 - **Issue-First**: Always create a GitHub issue first before starting work (`gh issue create`).
 - **Feature Branches**: Always create a feature branch off `develop`: `git checkout -b feature/issue-<ID>-<description>`.
+- **Auto-Deletion on Merge**: Feature branches are automatically deleted upon merge (`delete_branch_on_merge` is enabled), keeping the repository clean while preserving `develop` and `main`.
 - **Local Verification**: Always compile with MSVC Release and pass all CTest tests before opening a PR.
 
 ### CRITICAL RULE: USER-ONLY PR MERGE & CLOSURE

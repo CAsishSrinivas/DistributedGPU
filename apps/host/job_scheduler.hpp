@@ -49,6 +49,7 @@ public:
     // Must be called before submit().
     void setLocalExecutor(task_runtime::LocalExecutor exec);
     void setRemoteExecutor(task_runtime::RemoteExecutor exec);
+    void setWorkerCapabilities(const protocol::WorkerCapabilities& caps);
 
     // Start worker threads.
     void start(uint32_t workerThreads = 2);
