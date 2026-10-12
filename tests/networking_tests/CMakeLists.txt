@@ -1,0 +1,3 @@
+add_executable(test_networking test_networking.cpp)
+target_link_libraries(test_networking PRIVATE dgpu_networking dgpu_protocol)
+add_test(NAME networking_tests COMMAND test_networking)

@@ -1,0 +1,41 @@
+# Build directories and CMake outputs
+build/
+bin/
+lib/
+out/
+.vs/
+*.user
+*.suo
+
+# Visual Studio & MSVC artifacts
+*.obj
+*.ilk
+*.pdb
+*.tlog
+*.idb
+*.ipch
+*.exp
+*.lib
+*.dll
+*.exe
+x64/
+Debug/
+Release/
+
+# Logs and runtime telemetry
+*.log
+dgpu_dxgi.log
+dgpu_dxgi_previous.log
+dgpu.ini
+worker_telemetry.csv
+host_benchmark.csv
+
+# Backups and archives
+*.bak
+*.old
+*.new
+*.zip
+
+# OS artifacts
+.DS_Store
+Thumbs.db

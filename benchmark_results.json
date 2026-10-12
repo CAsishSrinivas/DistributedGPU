@@ -1,0 +1,63 @@
+{
+  "benchmark": "DistributedGPU M4/M5 Cooperative Multi-GPU Benchmark",
+  "timestamp": "1791787797",
+  "environment": {
+    "host_gpu": "NVIDIA GeForce RTX 3050 Laptop GPU",
+    "worker_gpu": "GTX 1650 Ti",
+    "link_bandwidth_mbps": 100,
+    "base_rtt_ms": 1
+  },
+  "results": [
+    {
+      "resolution": "512x512",
+      "repetitions": 100,
+      "scene_type": "realistic_game",
+      "mode1_host_alone_median_ms": 22.34,
+      "mode2_remote_alone_median_ms": 26.38,
+      "mode3_static_5050_median_ms": 27.05,
+      "mode4a_candidate_median_ms": 26.87,
+      "mode4b_policy_median_ms": 24.35,
+      "paired_mean_delta_ms": -2.50,
+      "ci95_lower_ms": -2.75,
+      "ci95_upper_ms": -2.24,
+      "p_value": 0.0000,
+      "speedup_vs_best": 0.90,
+      "statistically_significant": false,
+      "seam_mae": 0.00
+    },
+    {
+      "resolution": "1024x1024",
+      "repetitions": 100,
+      "scene_type": "realistic_game",
+      "mode1_host_alone_median_ms": 84.07,
+      "mode2_remote_alone_median_ms": 95.91,
+      "mode3_static_5050_median_ms": 96.49,
+      "mode4a_candidate_median_ms": 95.88,
+      "mode4b_policy_median_ms": 93.75,
+      "paired_mean_delta_ms": -11.24,
+      "ci95_lower_ms": -11.77,
+      "ci95_upper_ms": -10.71,
+      "p_value": 0.0000,
+      "speedup_vs_best": 0.88,
+      "statistically_significant": false,
+      "seam_mae": 0.00
+    },
+    {
+      "resolution": "1920x1080",
+      "repetitions": 100,
+      "scene_type": "realistic_game",
+      "mode1_host_alone_median_ms": 166.57,
+      "mode2_remote_alone_median_ms": 188.18,
+      "mode3_static_5050_median_ms": 190.03,
+      "mode4a_candidate_median_ms": 184.15,
+      "mode4b_policy_median_ms": 182.41,
+      "paired_mean_delta_ms": -18.45,
+      "ci95_lower_ms": -19.42,
+      "ci95_upper_ms": -17.48,
+      "p_value": 0.0000,
+      "speedup_vs_best": 0.90,
+      "statistically_significant": false,
+      "seam_mae": 0.00
+    }
+  ]
+}
