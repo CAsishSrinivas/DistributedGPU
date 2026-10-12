@@ -12,6 +12,8 @@
 
 #include "networking/tcp_connection.hpp"
 #include "networking/health_monitor.hpp"
+#include "networking/transport_config.hpp"
+#include "networking/interface_discovery.hpp"
 #include "protocol/message.hpp"
 
 #include <atomic>
@@ -577,6 +579,205 @@ static void test_adaptive_transfer_policy_client() {
     std::cout << "  adaptive transfer policy client: PASS\n";
 }
 
+// ─── Test: EndpointConfig parsing and serialization ──────────────────────────
+
+static void test_endpoint_config_parsing() {
+    auto cfg1 = EndpointConfig::parse("192.168.1.14:7777");
+    CHECK(cfg1.host == "192.168.1.14");
+    CHECK(cfg1.port == 7777);
+    CHECK(cfg1.transport == TransportType::Auto);
+
+    auto cfg2 = EndpointConfig::parse("usb4://192.168.100.2:9999");
+    CHECK(cfg2.host == "192.168.100.2");
+    CHECK(cfg2.port == 9999);
+    CHECK(cfg2.transport == TransportType::TcpUsb4);
+
+    auto cfg3 = EndpointConfig::parse("tcp://10.0.0.5:8080");
+    CHECK(cfg3.host == "10.0.0.5");
+    CHECK(cfg3.port == 8080);
+    CHECK(cfg3.transport == TransportType::TcpLan);
+
+    CHECK(stringToTransportType("usb4") == TransportType::TcpUsb4);
+    CHECK(stringToTransportType("usb-c") == TransportType::TcpUsb4);
+    CHECK(stringToTransportType("thunderbolt") == TransportType::TcpUsb4);
+    CHECK(stringToTransportType("tcp") == TransportType::TcpLan);
+    CHECK(stringToTransportType("lan") == TransportType::TcpLan);
+    CHECK(stringToTransportType("wifi") == TransportType::TcpLan);
+    CHECK(stringToTransportType("auto") == TransportType::Auto);
+
+    CHECK(transportTypeToString(TransportType::TcpUsb4) == "usb4");
+    CHECK(transportTypeToString(TransportType::TcpLan) == "tcp");
+    CHECK(transportTypeToString(TransportType::Auto) == "auto");
+
+    std::cout << "  endpoint config parsing: PASS\n";
+}
+
+// ─── Test: Interface discovery & enumeration ──────────────────────────────────
+
+static void test_interface_discovery() {
+    auto ifaces = InterfaceDiscovery::enumerateInterfaces();
+    CHECK(!ifaces.empty());
+
+    bool foundAnyValid = false;
+    for (const auto& iface : ifaces) {
+        if (!iface.adapterName.empty()) foundAnyValid = true;
+    }
+    CHECK(foundAnyValid);
+
+    auto queryMatches = InterfaceDiscovery::findInterfaces("127.0.0.1");
+    for (const auto& match : queryMatches) {
+        CHECK(match.ipv4Address.find("127.0.0.1") != std::string::npos);
+    }
+
+    auto bestLan = InterfaceDiscovery::resolveBestInterface(TransportType::TcpLan);
+    auto bestUsb4 = InterfaceDiscovery::resolveBestInterface(TransportType::TcpUsb4);
+    auto bestAuto = InterfaceDiscovery::resolveBestInterface(TransportType::Auto);
+    (void)bestLan; (void)bestUsb4; (void)bestAuto;
+
+    std::cout << "  interface discovery: PASS\n";
+}
+
+// ─── Test: TaskClient with EndpointConfig ────────────────────────────────────
+
+static void test_task_client_with_endpoint_config() {
+    WinsockInit wsa;
+    CHECK(wsa.ok());
+
+    WorkerCapabilities caps;
+    caps.gpuName = "Mock-Worker-GPU";
+    caps.maxWidth = 4096;
+    caps.maxHeight = 4096;
+    caps.supportedTasks = TaskCap_Blur;
+
+    TaskServer server;
+    CHECK(server.start(17785, [caps](TcpConnection conn) {
+        Message hello;
+        if (!conn.receiveMessage(hello)) return;
+        auto ack = Message::makeHelloAck("Worker", "Mock-Worker-GPU", 4096, caps);
+        if (!conn.sendMessage(ack)) return;
+
+        Message msg;
+        while (conn.receiveMessage(msg)) {
+            uint16_t msgType = 0;
+            std::memcpy(&msgType, &msg.header.messageType, sizeof(msgType));
+            msgType = _byteswap_ushort(msgType);
+            if (msgType == static_cast<uint16_t>(MessageType::Ping)) {
+                uint64_t tid = 0;
+                std::memcpy(&tid, &msg.header.taskId, sizeof(tid));
+                auto pong = Message::makePong(_byteswap_uint64(tid));
+                conn.sendMessage(pong);
+            } else if (msgType == static_cast<uint16_t>(MessageType::SubmitTask)) {
+                uint64_t tid = 0;
+                std::memcpy(&tid, &msg.header.taskId, sizeof(tid));
+                tid = _byteswap_uint64(tid);
+                TaskResult res;
+                res.taskId = tid;
+                res.status = TaskStatus::Ok;
+                Message resp;
+                resp.header.magic = _byteswap_ulong(MAGIC);
+                resp.header.version = _byteswap_ushort(PROTO_VERSION);
+                resp.header.messageType = _byteswap_ushort(static_cast<uint16_t>(MessageType::TaskResult));
+                resp.header.taskId = _byteswap_uint64(tid);
+                resp.payload = res.serialise();
+                resp.header.payloadSize = _byteswap_ulong(static_cast<uint32_t>(resp.payload.size()));
+                conn.sendMessage(resp);
+            }
+        }
+    }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    EndpointConfig ep;
+    ep.host = "127.0.0.1";
+    ep.port = 17785;
+    ep.transport = TransportType::TcpLan;
+    ep.localBindIp = "127.0.0.1";
+
+    TaskClient client;
+    CHECK(client.connect(ep));
+    CHECK(client.isConnected());
+    CHECK(client.endpointConfig().host == "127.0.0.1");
+    CHECK(client.endpointConfig().transport == TransportType::TcpLan);
+    CHECK(client.ping());
+
+    TaskRequest req;
+    req.taskId = 801;
+    req.type = TaskType::Blur;
+    req.width = 64;
+    req.height = 64;
+    auto res = client.submit(req);
+    CHECK(res.status == TaskStatus::Ok);
+    CHECK(res.taskId == 801);
+
+    client.disconnect();
+    server.stop();
+    std::cout << "  task client with endpoint config: PASS\n";
+}
+
+// ─── Test: TaskServer with explicit bind IP ──────────────────────────────────
+
+static void test_task_server_explicit_bind_ip() {
+    WinsockInit wsa;
+    CHECK(wsa.ok());
+
+    TaskServer server;
+    CHECK(server.start(17786, echoHandler, "127.0.0.1"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    TcpConnection client;
+    ConnectionOptions opts;
+    opts.localBindIp = "127.0.0.1";
+    CHECK(client.connect("127.0.0.1", 17786, opts));
+
+    auto ping = Message::makePing(999);
+    CHECK(client.sendMessage(ping));
+
+    Message pong;
+    CHECK(client.receiveMessage(pong));
+    uint32_t magic = 0;
+    std::memcpy(&magic, &pong.header.magic, sizeof(magic));
+    CHECK(_byteswap_ulong(magic) == MAGIC);
+
+    client.close();
+    server.stop();
+    std::cout << "  task server explicit bind ip: PASS\n";
+}
+
+// ─── Test: Reconnect behavior with EndpointConfig ─────────────────────────────
+
+static void test_reconnect_behavior_with_endpoint_config() {
+    WinsockInit wsa;
+    CHECK(wsa.ok());
+
+    EndpointConfig ep;
+    ep.host = "127.0.0.1";
+    ep.port = 17787;
+    ep.transport = TransportType::TcpUsb4;
+
+    TaskClient client;
+    CHECK(!client.connect(ep));
+    CHECK(!client.isConnected());
+
+    WorkerCapabilities caps;
+    caps.gpuName = "Reconnected-GPU";
+
+    TaskServer server;
+    CHECK(server.start(17787, [caps](TcpConnection conn) {
+        Message hello;
+        if (!conn.receiveMessage(hello)) return;
+        auto ack = Message::makeHelloAck("Worker", "Reconnected-GPU", 4096, caps);
+        conn.sendMessage(ack);
+    }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    CHECK(client.connect(ep));
+    CHECK(client.isConnected());
+    CHECK(client.capabilities().gpuName == "Reconnected-GPU");
+
+    client.disconnect();
+    server.stop();
+    std::cout << "  reconnect behavior with endpoint config: PASS\n";
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 int main() {
@@ -589,6 +790,11 @@ int main() {
     test_worker_capabilities_negotiation();
     test_health_monitor_state_transitions();
     test_adaptive_transfer_policy_client();
+    test_endpoint_config_parsing();
+    test_interface_discovery();
+    test_task_client_with_endpoint_config();
+    test_task_server_explicit_bind_ip();
+    test_reconnect_behavior_with_endpoint_config();
     std::cout << g_passed << " passed, " << g_failed << " failed.\n";
     return g_failed == 0 ? 0 : 1;
 }

@@ -2,6 +2,7 @@
 
 #include "protocol/adaptive_transfer_policy.hpp"
 #include "protocol/message.hpp"
+#include "networking/transport_config.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -15,11 +16,12 @@ namespace dgpu::networking {
 // ─── Connection options ───────────────────────────────────────────────────────
 
 struct ConnectionOptions {
-    uint32_t connectTimeoutMs  = 10'000;
-    uint32_t sendTimeoutMs     = 30'000;
-    uint32_t recvTimeoutMs     = 60'000;
-    uint32_t keepAliveIdleMs   = 15'000;
-    uint32_t maxPayloadBytes   = protocol::MAX_PAYLOAD;
+    uint32_t    connectTimeoutMs  = 10'000;
+    uint32_t    sendTimeoutMs     = 30'000;
+    uint32_t    recvTimeoutMs     = 60'000;
+    uint32_t    keepAliveIdleMs   = 15'000;
+    uint32_t    maxPayloadBytes   = protocol::MAX_PAYLOAD;
+    std::string localBindIp;      ///< If non-empty, binds socket to this local interface IP before connect()
 };
 
 // ─── TcpConnection ───────────────────────────────────────────────────────────
@@ -77,7 +79,7 @@ public:
     TaskServer& operator=(const TaskServer&) = delete;
 
     // Bind and listen; handler is called on a new thread for each connection
-    [[nodiscard]] bool start(uint16_t port, ConnectionHandler handler);
+    [[nodiscard]] bool start(uint16_t port, ConnectionHandler handler, const std::string& bindIp = "0.0.0.0");
 
     // Signal the accept loop to stop (existing handler threads complete normally)
     void stop();
@@ -103,6 +105,11 @@ public:
     [[nodiscard]] bool connect(const std::string& host,
                                uint16_t           port,
                                const ConnectionOptions& opts = {});
+
+    [[nodiscard]] bool connect(const EndpointConfig&    config,
+                               const ConnectionOptions& opts = {});
+
+    [[nodiscard]] const EndpointConfig& endpointConfig() const noexcept;
 
     [[nodiscard]] protocol::TaskResult submit(const protocol::TaskRequest& req);
 
@@ -156,6 +163,7 @@ private:
     TransferMetrics                  m_lastMetrics;
     protocol::WorkerCapabilities     m_workerCaps{};
     bool                             m_hasCaps{false};
+    EndpointConfig                   m_endpointConfig{};
     mutable std::mutex               m_submitMu;
 };
 

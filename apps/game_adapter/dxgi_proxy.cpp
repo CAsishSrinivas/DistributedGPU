@@ -14,6 +14,7 @@
 #include "../host/job_scheduler.hpp"
 #include "../host/frame_compositor.hpp"
 #include "networking/tcp_connection.hpp"
+#include "networking/transport_config.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -142,13 +143,17 @@ static std::unique_ptr<dgpu::networking::WinsockInit> g_winsock;
 bool g_enableWriteback   = false;
 uint32_t g_downsampleFactor = 4; // Default 4x downsample (480x270 at 1080p, 518 KB payload)
 
-// Resolves Worker IP from config file, environment variable, or Windows registry
-std::string resolveWorkerIp() {
-    std::string targetIp;
-    std::ifstream cfg("dgpu.ini");
-    if (cfg.is_open()) {
+// Resolves Worker Endpoint & Transport configuration from dgpu.ini, env, or registry
+dgpu::networking::EndpointConfig resolveEndpointConfig() {
+    dgpu::networking::EndpointConfig cfg;
+    cfg.host = "";
+    cfg.port = 7777;
+    cfg.transport = dgpu::networking::TransportType::Auto;
+
+    std::ifstream file("dgpu.ini");
+    if (file.is_open()) {
         std::string line;
-        while (std::getline(cfg, line)) {
+        while (std::getline(file, line)) {
             line.erase(0, line.find_first_not_of(" \t\r\n"));
             line.erase(line.find_last_not_of(" \t\r\n") + 1);
             if (line.empty() || line[0] == '#') continue;
@@ -158,36 +163,58 @@ std::string resolveWorkerIp() {
             } else if (line.find("scale=2") != std::string::npos) {
                 g_downsampleFactor = 2;
                 logMsg("[dgpu_dxgi] Scale set to 2x (960x540) from dgpu.ini");
-            } else if (targetIp.empty() && line.find('=') == std::string::npos) {
-                targetIp = line;
+            } else if (line.starts_with("transport=")) {
+                cfg.transport = dgpu::networking::stringToTransportType(line.substr(10));
+                logMsg("[dgpu_dxgi] Loaded transport from dgpu.ini: " + line.substr(10));
+            } else if (line.starts_with("interface=")) {
+                cfg.interfaceName = line.substr(10);
+                logMsg("[dgpu_dxgi] Loaded interface from dgpu.ini: " + cfg.interfaceName);
+            } else if (line.starts_with("bind_ip=")) {
+                cfg.localBindIp = line.substr(8);
+                logMsg("[dgpu_dxgi] Loaded bind_ip from dgpu.ini: " + cfg.localBindIp);
+            } else if (line.starts_with("usb4_ip=") && cfg.transport == dgpu::networking::TransportType::TcpUsb4) {
+                cfg.host = line.substr(8);
+                logMsg("[dgpu_dxgi] Loaded USB4 worker IP from dgpu.ini: " + cfg.host);
+            } else if (cfg.host.empty() && line.find('=') == std::string::npos) {
+                cfg.host = line;
                 logMsg("[dgpu_dxgi] Loaded worker IP from dgpu.ini: " + line);
             }
         }
     }
-    if (!targetIp.empty()) return targetIp;
 
-    // 2. Check process environment variable
-    char envIp[128] = {0};
-    if (GetEnvironmentVariableA("DGPU_WORKER_IP", envIp, sizeof(envIp)) > 0 && envIp[0] != '\0') {
-        logMsg("[dgpu_dxgi] Loaded worker IP from DGPU_WORKER_IP env: " + std::string(envIp));
-        return envIp;
-    }
-
-    // 3. Check Windows User Registry HKCU\Environment\DGPU_WORKER_IP
-    HKEY hKey = nullptr;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Environment", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        char regVal[128] = {0};
-        DWORD sz = sizeof(regVal);
-        if (RegQueryValueExA(hKey, "DGPU_WORKER_IP", nullptr, nullptr, reinterpret_cast<LPBYTE>(regVal), &sz) == ERROR_SUCCESS && regVal[0] != '\0') {
-            RegCloseKey(hKey);
-            logMsg("[dgpu_dxgi] Loaded worker IP from HKCU\\Environment: " + std::string(regVal));
-            return regVal;
+    if (cfg.host.empty()) {
+        char envIp[128] = {0};
+        if (GetEnvironmentVariableA("DGPU_WORKER_IP", envIp, sizeof(envIp)) > 0 && envIp[0] != '\0') {
+            cfg.host = envIp;
+            logMsg("[dgpu_dxgi] Loaded worker IP from DGPU_WORKER_IP env: " + std::string(envIp));
         }
-        RegCloseKey(hKey);
     }
 
-    logMsg("[dgpu_dxgi] Defaulting to localhost: 127.0.0.1");
-    return "127.0.0.1";
+    if (cfg.host.empty()) {
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExA(HKEY_CURRENT_USER, "Environment", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            char regVal[128] = {0};
+            DWORD sz = sizeof(regVal);
+            if (RegQueryValueExA(hKey, "DGPU_WORKER_IP", nullptr, nullptr, reinterpret_cast<LPBYTE>(regVal), &sz) == ERROR_SUCCESS && regVal[0] != '\0') {
+                RegCloseKey(hKey);
+                cfg.host = regVal;
+                logMsg("[dgpu_dxgi] Loaded worker IP from HKCU\\Environment: " + std::string(regVal));
+            } else {
+                RegCloseKey(hKey);
+            }
+        }
+    }
+
+    if (cfg.host.empty()) {
+        cfg.host = "127.0.0.1";
+        logMsg("[dgpu_dxgi] Defaulting to localhost: 127.0.0.1");
+    }
+
+    return cfg;
+}
+
+std::string resolveWorkerIp() {
+    return resolveEndpointConfig().host;
 }
 
 // ─── Swapchain Format & Color Space Handling ─────────────────────────────────
@@ -479,11 +506,12 @@ void initDistributedHook(IDXGISwapChain* swapChain) {
     DXGI_SWAP_CHAIN_DESC desc{};
     if (FAILED(swapChain->GetDesc(&desc))) return;
 
-    std::string workerIp = resolveWorkerIp();
-    uint16_t    port     = 7777;
+    auto endpoint = resolveEndpointConfig();
 
-    logMsg("[dgpu_dxgi] Connecting to Distributed GPU worker at " + workerIp + ":" + std::to_string(port) + "...");
-    g_workerConnected = g_workerClient.connect(workerIp, port);
+    logMsg("[dgpu_dxgi] Connecting to Distributed GPU worker (" +
+           std::string(dgpu::networking::transportTypeToString(endpoint.transport)) + ") at " +
+           endpoint.host + ":" + std::to_string(endpoint.port) + "...");
+    g_workerConnected = g_workerClient.connect(endpoint);
     if (g_workerConnected) {
         logMsg("[dgpu_dxgi] Connected to Distributed GPU worker. Handshake verified.");
     } else {
@@ -492,8 +520,8 @@ void initDistributedHook(IDXGISwapChain* swapChain) {
 
     g_scheduler.setRemoteExecutor([](const dgpu::protocol::TaskRequest& req) {
         if (!g_workerClient.isConnected()) {
-            std::string ip = resolveWorkerIp();
-            g_workerClient.connect(ip, 7777);
+            auto ep = resolveEndpointConfig();
+            g_workerClient.connect(ep);
         }
         return g_workerClient.submit(req);
     });

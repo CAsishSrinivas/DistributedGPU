@@ -38,4 +38,5 @@ host_benchmark.csv
 
 # OS artifacts
 .DS_Store
+scratch/
 Thumbs.db

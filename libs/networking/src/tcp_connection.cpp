@@ -1,13 +1,18 @@
 // networking/tcp_connection.cpp
 // Winsock TCP implementation with framed message I/O.
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "Ws2_32.lib")
 
 #include "networking/tcp_connection.hpp"
+#include "networking/interface_discovery.hpp"
 #include "protocol/lz4.hpp"
 
 #include <array>
@@ -131,6 +136,16 @@ bool TcpConnection::connect(const std::string& host, uint16_t port,
     for (auto* r = res; r != nullptr; r = r->ai_next) {
         s = ::socket(r->ai_family, r->ai_socktype, r->ai_protocol);
         if (s == INVALID_SOCKET) continue;
+        if (!opts.localBindIp.empty()) {
+            sockaddr_in bindAddr{};
+            bindAddr.sin_family = AF_INET;
+            bindAddr.sin_port   = 0;
+            if (inet_pton(AF_INET, opts.localBindIp.c_str(), &bindAddr.sin_addr) == 1) {
+                if (::bind(s, reinterpret_cast<sockaddr*>(&bindAddr), sizeof(bindAddr)) == SOCKET_ERROR) {
+                    std::cerr << "[tcp] warning: failed to bind local IP " << opts.localBindIp << ": " << WSAGetLastError() << "\n";
+                }
+            }
+        }
         if (::connect(s, r->ai_addr, static_cast<int>(r->ai_addrlen)) == 0) break;
         ::closesocket(s);
         s = INVALID_SOCKET;
@@ -269,7 +284,7 @@ struct TaskServer::Impl {
 TaskServer::TaskServer() : m_impl(std::make_unique<Impl>()) {}
 TaskServer::~TaskServer() { stop(); }
 
-bool TaskServer::start(uint16_t port, ConnectionHandler handler) {
+bool TaskServer::start(uint16_t port, ConnectionHandler handler, const std::string& bindIp) {
     static WinsockInit s_autoWinsock;
     m_impl->handler = std::move(handler);
 
@@ -281,9 +296,15 @@ bool TaskServer::start(uint16_t port, ConnectionHandler handler) {
                reinterpret_cast<const char*>(&reuseAddr), sizeof(reuseAddr));
 
     sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(port);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    if (!bindIp.empty() && bindIp != "0.0.0.0") {
+        if (inet_pton(AF_INET, bindIp.c_str(), &addr.sin_addr) != 1) {
+            addr.sin_addr.s_addr = INADDR_ANY;
+        }
+    } else {
+        addr.sin_addr.s_addr = INADDR_ANY;
+    }
 
     if (::bind(m_impl->listenSock, reinterpret_cast<sockaddr*>(&addr),
                sizeof(addr)) == SOCKET_ERROR) {
@@ -371,6 +392,10 @@ TaskClient::~TaskClient() { disconnect(); }
 bool TaskClient::connect(const std::string& host, uint16_t port,
                           const ConnectionOptions& opts) {
     std::lock_guard<std::mutex> lk(m_submitMu);
+    m_endpointConfig.host = host;
+    m_endpointConfig.port = port;
+    m_endpointConfig.localBindIp = opts.localBindIp;
+
     if (!m_conn.connect(host, port, opts)) return false;
 
     // Handshake: send HELLO and await valid HELLO_ACK
@@ -414,6 +439,43 @@ bool TaskClient::connect(const std::string& host, uint16_t port,
     }
 
     return true;
+}
+
+bool TaskClient::connect(const EndpointConfig& config, const ConnectionOptions& opts) {
+    ConnectionOptions resolvedOpts = opts;
+    if (resolvedOpts.localBindIp.empty()) {
+        resolvedOpts.localBindIp = config.localBindIp;
+    }
+
+    if (resolvedOpts.localBindIp.empty()) {
+        if (!config.interfaceName.empty()) {
+            auto matches = InterfaceDiscovery::findInterfaces(config.interfaceName);
+            for (const auto& iface : matches) {
+                if (iface.isUp && !iface.ipv4Address.empty()) {
+                    resolvedOpts.localBindIp = iface.ipv4Address;
+                    break;
+                }
+            }
+        } else if (config.transport == TransportType::TcpUsb4) {
+            auto usb4 = InterfaceDiscovery::findUsb4Interfaces();
+            for (const auto& iface : usb4) {
+                if (iface.isUp && !iface.ipv4Address.empty()) {
+                    resolvedOpts.localBindIp = iface.ipv4Address;
+                    break;
+                }
+            }
+        }
+    }
+
+    m_endpointConfig = config;
+    if (m_endpointConfig.localBindIp.empty()) {
+        m_endpointConfig.localBindIp = resolvedOpts.localBindIp;
+    }
+    return connect(config.host, config.port, resolvedOpts);
+}
+
+const EndpointConfig& TaskClient::endpointConfig() const noexcept {
+    return m_endpointConfig;
 }
 
 protocol::TaskResult TaskClient::submit(const protocol::TaskRequest& req) {

@@ -8,6 +8,8 @@
 #include <objbase.h>
 
 #include "networking/tcp_connection.hpp"
+#include "networking/transport_config.hpp"
+#include "networking/interface_discovery.hpp"
 #include "protocol/message.hpp"
 #include "protocol/lz4.hpp"
 #include "d3d12/gpu_executor.hpp"
@@ -269,12 +271,66 @@ static void handleConnection(dgpu::networking::TcpConnection conn,
 int main(int argc, char* argv[]) {
     std::cout << "=== DistributedGPU Worker ===\n";
 
-    // Optional command-line override for port & iterations: worker.exe [port] [iterations]
-    uint16_t port = WORKER_PORT;
-    if (argc >= 2) port = static_cast<uint16_t>(std::stoi(argv[1]));
-    if (argc >= 3) {
-        SetEnvironmentVariableA("DGPU_ITERATIONS", argv[2]);
-        std::cout << "[worker] Target compute iterations set via CLI: " << argv[2] << "\n";
+    // Command-line options & positional compatibility: worker.exe [options] [port] [iterations]
+    uint16_t    port = WORKER_PORT;
+    std::string bindIp = "0.0.0.0";
+    std::string interfaceName = "";
+    bool        hasPositionalPort = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: worker.exe [options] [port] [iterations]\n\n"
+                      << "Options:\n"
+                      << "  -h, --help           Show this help message and exit\n"
+                      << "  --port <port>        TCP port to listen on (default: 7777)\n"
+                      << "  --bind-ip <ip>       Local interface IP to bind on (default: 0.0.0.0)\n"
+                      << "  --interface <name>   Local interface name to bind exclusively on (e.g. \"USB4\")\n"
+                      << "  --iterations <n>     Target compute shader iterations\n"
+                      << "  --list-interfaces    List available network adapters and exit\n\n"
+                      << "Positional arguments (backward compatible):\n"
+                      << "  [port]               TCP listening port\n"
+                      << "  [iterations]         Target compute shader iterations\n";
+            return 0;
+        } else if (arg == "--list-interfaces") {
+            auto ifaces = dgpu::networking::InterfaceDiscovery::enumerateInterfaces();
+            std::cout << "Available Network Interfaces:\n";
+            for (const auto& iface : ifaces) {
+                std::cout << "  - " << iface.friendlyName << " [" << dgpu::networking::interfaceTypeToString(iface.type) << "]"
+                          << (iface.isUp ? " (UP)" : " (DOWN)")
+                          << " IP: " << (iface.ipv4Address.empty() ? "none" : iface.ipv4Address)
+                          << " Speed: " << (iface.linkSpeedBps / 1'000'000) << " Mbps\n"
+                          << "    Desc: " << iface.description << "\n";
+            }
+            return 0;
+        } else if (arg == "--port" && i + 1 < argc) {
+            port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--bind-ip" && i + 1 < argc) {
+            bindIp = argv[++i];
+        } else if (arg == "--interface" && i + 1 < argc) {
+            interfaceName = argv[++i];
+        } else if (arg == "--iterations" && i + 1 < argc) {
+            SetEnvironmentVariableA("DGPU_ITERATIONS", argv[++i]);
+            std::cout << "[worker] Target compute iterations set via CLI: " << argv[i] << "\n";
+        } else if (!arg.starts_with("-")) {
+            if (!hasPositionalPort) {
+                port = static_cast<uint16_t>(std::stoi(arg));
+                hasPositionalPort = true;
+            } else {
+                SetEnvironmentVariableA("DGPU_ITERATIONS", arg.c_str());
+                std::cout << "[worker] Target compute iterations set via CLI: " << arg << "\n";
+            }
+        }
+    }
+
+    if (bindIp == "0.0.0.0" && !interfaceName.empty()) {
+        auto matches = dgpu::networking::InterfaceDiscovery::findInterfaces(interfaceName);
+        for (const auto& iface : matches) {
+            if (iface.isUp && !iface.ipv4Address.empty()) {
+                bindIp = iface.ipv4Address;
+                break;
+            }
+        }
     }
 
     // Check dgpu.ini for local configuration
@@ -336,14 +392,16 @@ int main(int argc, char* argv[]) {
     dgpu::networking::TaskServer server;
     bool started = server.start(port, [&executor](dgpu::networking::TcpConnection conn) {
         handleConnection(std::move(conn), executor);
-    });
+    }, bindIp);
 
     if (!started) {
-        std::cerr << "[worker] Failed to bind on port " << port << '\n';
+        std::cerr << "[worker] Failed to bind on " << bindIp << ":" << port << '\n';
         return 3;
     }
 
-    std::cout << "[worker] Listening on port " << port << " — press Ctrl+C to stop\n";
+    std::cout << "[worker] Listening on " << bindIp << ":" << port;
+    if (!interfaceName.empty()) std::cout << " (interface: " << interfaceName << ")";
+    std::cout << " — press Ctrl+C to stop\n";
 
     // Wait for shutdown
     while (g_running) {
