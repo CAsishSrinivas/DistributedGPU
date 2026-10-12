@@ -17,6 +17,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
     - name: Set up MSVC environment
       uses: ilammy/msvc-dev-cmd@v1
@@ -52,6 +54,16 @@ jobs:
         "release_tag=$tag" >> $env:GITHUB_OUTPUT
         "is_prerelease=$isDevelop" >> $env:GITHUB_OUTPUT
 
+    - name: Generate Dynamic Release Notes from File Changes
+      id: notes
+      shell: pwsh
+      run: |
+        $branch = "${{ github.ref_name }}"
+        $notesFile = "release_notes.md"
+        .\scripts\generate_release_notes.ps1 -TargetRef "HEAD" -Branch $branch -OutputFile $notesFile
+        Write-Host "Generated Release Notes Preview:" -ForegroundColor Cyan
+        Get-Content $notesFile
+
     - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
       with:
@@ -69,19 +81,16 @@ jobs:
         $isPre = "${{ steps.package.outputs.is_prerelease }}" -eq "True"
 
         $title = if ($isPre) { "DistributedGPU Develop (Latest Build)" } else { "DistributedGPU Production (Stable)" }
-        $notes = if ($isPre) {
-          "Automated continuous integration release from develop branch for Laptop B / worker testing nodes."
-        } else {
-          "Production release from main branch. Validated stable release."
-        }
+        $notesFile = "release_notes.md"
 
         # Check if release already exists
         $releaseExists = gh release view $tag --json tagName 2>$null
         if ($LASTEXITCODE -eq 0) {
-          Write-Host "Updating existing release $tag..." -ForegroundColor Cyan
+          Write-Host "Updating existing release $tag with new asset and dynamic notes..." -ForegroundColor Cyan
           gh release upload $tag $asset --clobber
+          gh release edit $tag --title $title --notes-file $notesFile
         } else {
-          Write-Host "Creating new release $tag..." -ForegroundColor Cyan
+          Write-Host "Creating new release $tag with dynamic notes..." -ForegroundColor Cyan
           $preFlag = if ($isPre) { "--prerelease" } else { "" }
-          gh release create $tag $asset --title $title --notes $notes $preFlag
+          gh release create $tag $asset --title $title --notes-file $notesFile $preFlag
         }
