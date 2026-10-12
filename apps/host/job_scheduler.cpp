@@ -64,9 +64,19 @@ void JobScheduler::setRemoteExecutor(task_runtime::RemoteExecutor exec) {
         uint64_t totalUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
         if (result.status == protocol::TaskStatus::Ok) {
-            uint64_t netUs = (totalUs > result.gpuUs) ? (totalUs - result.gpuUs) : 1000;
-            this->recordRemoteSuccess(req.type, req.width, req.height, result.gpuUs, netUs, req.input.size(),
-                                      result.output.size());
+            uint64_t workerExecUs = (result.totalUs > 0) ? result.totalUs : result.gpuUs;
+            uint64_t codecUs = result.compressUs + result.decompressUs + result.serializeUs + result.deserializeUs;
+            uint64_t netUs = (result.pureNetworkRttUs > 0)
+                                 ? result.pureNetworkRttUs
+                                 : ((totalUs > (workerExecUs + codecUs)) ? (totalUs - (workerExecUs + codecUs)) : 1000);
+
+            size_t sendWire = (result.wireSendBytes > 0) ? result.wireSendBytes : req.input.size();
+            size_t recvWire = (result.wireRecvBytes > 0) ? result.wireRecvBytes : result.output.size();
+            size_t uncompSend = (result.uncompressedSendBytes > 0) ? result.uncompressedSendBytes : req.input.size();
+
+            this->recordRemoteSuccess(req.type, req.width, req.height, result.gpuUs, netUs,
+                                      uncompSend, sendWire, result.compressUs, result.decompressUs,
+                                      sendWire, recvWire, totalUs);
         } else {
             this->recordRemoteFailure();
         }
@@ -218,7 +228,9 @@ void JobScheduler::recordRemoteSuccess(uint32_t width, uint32_t height, uint64_t
 }
 
 void JobScheduler::recordRemoteSuccess(protocol::TaskType type, uint32_t width, uint32_t height, uint64_t remoteGpuUs,
-                                       uint64_t networkUs, size_t uncompressedBytes, size_t compressedBytes) {
+                                       uint64_t networkUs, size_t uncompressedBytes, size_t compressedBytes,
+                                       uint64_t compressUs, uint64_t decompressUs,
+                                       size_t wireSendBytes, size_t wireRecvBytes, uint64_t totalTurnaroundUs) {
     m_impl->breaker.recordSuccess();
     std::lock_guard<std::mutex> lk(m_impl->mu);
     m_impl->metrics.emaRemoteUs = emaUpdate(m_impl->metrics.emaRemoteUs, static_cast<double>(remoteGpuUs));
@@ -232,16 +244,22 @@ void JobScheduler::recordRemoteSuccess(protocol::TaskType type, uint32_t width, 
         rm.emaNetworkRttUs = emaUpdate(rm.emaNetworkRttUs, static_cast<double>(networkUs));
         ++rm.remoteSamples;
 
-        if (networkUs > 500) {
-            double totalBytes = static_cast<double>(static_cast<uint64_t>(width) * height * 4 * 2);
-            double measuredBps = (totalBytes / static_cast<double>(networkUs)) * 1'000'000.0;
+        // Use actual measured wire bytes rather than an uncompressed full-frame assumption
+        size_t totalWire = wireSendBytes + wireRecvBytes;
+        if (totalWire == 0) {
+            totalWire = (compressedBytes > 0) ? (compressedBytes * 2) : (static_cast<uint64_t>(width) * height * 4 * 2);
+        }
+
+        if (networkUs > 50 && totalWire > 0) {
+            double measuredBps = (static_cast<double>(totalWire) / static_cast<double>(networkUs)) * 1'000'000.0;
             m_impl->linkBandwidthBps =
                 static_cast<uint64_t>(emaUpdate(static_cast<double>(m_impl->linkBandwidthBps), measuredBps));
             m_impl->costModel.setLinkBandwidthBps(m_impl->linkBandwidthBps);
         }
 
-        m_impl->costModel.recordRemoteSuccess(type, width, height, remoteGpuUs, networkUs, remoteGpuUs + networkUs,
-                                              uncompressedBytes, compressedBytes);
+        uint64_t turnaround = (totalTurnaroundUs > 0) ? totalTurnaroundUs : (remoteGpuUs + networkUs);
+        m_impl->costModel.recordRemoteSuccess(type, width, height, remoteGpuUs, networkUs, turnaround,
+                                              uncompressedBytes, compressedBytes, compressUs, decompressUs);
     }
 }
 
@@ -274,7 +292,8 @@ void JobScheduler::recordLocalSuccess(protocol::TaskType type, uint32_t width, u
     }
 }
 
-const SchedulerMetrics& JobScheduler::metrics() const noexcept {
+SchedulerMetrics JobScheduler::metrics() const {
+    std::lock_guard<std::mutex> lk(m_impl->mu);
     return m_impl->metrics;
 }
 

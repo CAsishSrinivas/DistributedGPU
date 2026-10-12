@@ -134,6 +134,11 @@ public:
         float    compressionRatioRecv{1.0f};
         bool     wasCompressed{false};
         float    estimatedRatio{1.0f};
+        uint64_t serializationUs{0};
+        uint64_t sendFlightUs{0};
+        uint64_t recvWaitUs{0};
+        uint64_t deserializationUs{0};
+        uint64_t pureNetworkRttUs{0};
     };
 
     [[nodiscard]] TransferMetrics lastTransferMetrics() const noexcept;

@@ -65,7 +65,9 @@ public:
     void recordRemoteSuccess(uint64_t remoteGpuUs, uint64_t networkUs);
     void recordRemoteSuccess(uint32_t width, uint32_t height, uint64_t remoteGpuUs, uint64_t networkUs);
     void recordRemoteSuccess(protocol::TaskType type, uint32_t width, uint32_t height, uint64_t remoteGpuUs,
-                             uint64_t networkUs, size_t uncompressedBytes = 0, size_t compressedBytes = 0);
+                             uint64_t networkUs, size_t uncompressedBytes = 0, size_t compressedBytes = 0,
+                             uint64_t compressUs = 0, uint64_t decompressUs = 0,
+                             size_t wireSendBytes = 0, size_t wireRecvBytes = 0, uint64_t totalTurnaroundUs = 0);
     void recordRemoteFailure();
 
     // Call after each completed local task (updates EMA and cost model).
@@ -74,7 +76,7 @@ public:
     void recordLocalSuccess(protocol::TaskType type, uint32_t width, uint32_t height, uint64_t localTotalUs,
                             uint64_t payloadBytes);
 
-    [[nodiscard]] const SchedulerMetrics& metrics() const noexcept;
+    [[nodiscard]] SchedulerMetrics metrics() const;
     [[nodiscard]] task_runtime::CircuitBreaker::State circuitState() const noexcept;
 
     // Link bandwidth and network latency configuration
