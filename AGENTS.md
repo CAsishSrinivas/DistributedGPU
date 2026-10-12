@@ -29,6 +29,26 @@
    - `## Verification & Test Results`: Compilation evidence, CTest output, and benchmark numbers.
    - `## Impact on Cross-Device Releases`: Effect on `develop` or `main` release artifacts.
 
+### MANDATORY DETAILED COMMIT MESSAGES
+> **Every Git commit must contain a structured, multi-line commit message.** One-liner, vague, or terse commits (e.g. "fix", "update", "wip") are strictly forbidden.
+
+**Commit Message Format**:
+```text
+<type>(<scope>): <concise imperative summary (<= 72 chars)>
+
+## What
+- Detailed bullet points of every file and component modified or created.
+
+## Why / Motivation
+- Detailed technical reason, architectural context, or bug root-cause explanation.
+
+## Impact & Subsystems
+- Affected modules, latency/throughput considerations, or runtime behaviors.
+
+Refs: #<ID> (or Closes: #<ID>)
+```
+Allowed Types: `feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `ci`, `chore`.
+
 ---
 
 ## 2. Cross-Device Release Policy

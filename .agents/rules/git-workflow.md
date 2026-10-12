@@ -45,3 +45,10 @@ Direct pushes to `develop` and `main` branches are **strictly forbidden**. All c
    - **Issues**: Must contain `Problem Statement & Context`, `Objective & Requirements`, `Technical Specifications`, and `Acceptance Criteria`.
    - **PRs**: Must contain `Summary of Changes`, `Motivation & Linked Issues`, `Detailed Code Modifications`, `Verification & Test Results`, and `Impact on Cross-Device Releases`.
    - Brief or one-line descriptions are strictly unacceptable.
+
+7. **Detailed Commit Message Standards**:
+   - Every commit message must be multi-line and structured:
+     - Header: `<type>(<scope>): <summary (<= 72 chars)>`
+     - Body: `## What` (itemized list of modifications), `## Why / Motivation` (technical context & rationale), `## Impact & Subsystems`.
+     - Footer: `Refs: #<ID>` or `Closes: #<ID>`.
+   - Terse or single-line commits without technical explanations are strictly forbidden.
