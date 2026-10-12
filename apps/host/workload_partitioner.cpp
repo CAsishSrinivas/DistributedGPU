@@ -12,6 +12,151 @@
 
 namespace dgpu::host {
 
+// ─── ApronCache Implementation (Phase 2.5) ───────────────────────────────────
+
+std::optional<float> ApronCache::lookupAlpha(protocol::TaskType type,
+                                             uint32_t width,
+                                             uint32_t height,
+                                             uint64_t bandwidthBps) const noexcept {
+    std::lock_guard<std::mutex> lk(m_mu);
+    ApronCacheKey key{type, width, height, quantizeBandwidth(bandwidthBps)};
+    auto it = m_entries.find(key);
+    if (it != m_entries.end()) {
+        ++it->second.hitCount;
+        ++m_stats.hits;
+        return it->second.calibratedAlpha;
+    }
+    ++m_stats.misses;
+    return std::nullopt;
+}
+
+std::optional<ApronCacheEntry> ApronCache::getEntry(protocol::TaskType type,
+                                                    uint32_t width,
+                                                    uint32_t height,
+                                                    uint64_t bandwidthBps) const noexcept {
+    std::lock_guard<std::mutex> lk(m_mu);
+    ApronCacheKey key{type, width, height, quantizeBandwidth(bandwidthBps)};
+    auto it = m_entries.find(key);
+    if (it != m_entries.end()) {
+        ++it->second.hitCount;
+        ++m_stats.hits;
+        return it->second;
+    }
+    ++m_stats.misses;
+    return std::nullopt;
+}
+
+void ApronCache::put(protocol::TaskType type,
+                     uint32_t width,
+                     uint32_t height,
+                     uint64_t bandwidthBps,
+                     float alpha,
+                     uint32_t apronRadius,
+                     double localUs,
+                     double remoteUs,
+                     double wallUs) noexcept {
+    std::lock_guard<std::mutex> lk(m_mu);
+    ApronCacheKey key{type, width, height, quantizeBandwidth(bandwidthBps)};
+    auto& entry = m_entries[key];
+    entry.calibratedAlpha = alpha;
+    entry.apronRadius = apronRadius;
+    entry.emaLocalUs = localUs;
+    entry.emaRemoteUs = remoteUs;
+    entry.emaWallUs = wallUs;
+    entry.lastAccess = std::chrono::steady_clock::now();
+    ++entry.updateCount;
+    m_stats.entryCount = m_entries.size();
+}
+
+float ApronCache::recordFeedback(protocol::TaskType type,
+                                 uint32_t width,
+                                 uint32_t height,
+                                 uint64_t bandwidthBps,
+                                 double actualLocalUs,
+                                 double actualRemoteUs,
+                                 double actualWallUs,
+                                 float learningRate) noexcept {
+    std::lock_guard<std::mutex> lk(m_mu);
+    ApronCacheKey key{type, width, height, quantizeBandwidth(bandwidthBps)};
+    auto it = m_entries.find(key);
+    if (it == m_entries.end()) {
+        ApronCacheEntry entry;
+        entry.calibratedAlpha = 0.50f;
+        entry.emaLocalUs = actualLocalUs;
+        entry.emaRemoteUs = actualRemoteUs;
+        entry.emaWallUs = actualWallUs;
+        entry.lastAccess = std::chrono::steady_clock::now();
+        entry.updateCount = 1;
+        m_entries[key] = entry;
+        m_stats.entryCount = m_entries.size();
+        it = m_entries.find(key);
+    }
+
+    auto& entry = it->second;
+    entry.emaLocalUs  = (entry.emaLocalUs <= 0.0)  ? actualLocalUs  : (0.2 * actualLocalUs  + 0.8 * entry.emaLocalUs);
+    entry.emaRemoteUs = (entry.emaRemoteUs <= 0.0) ? actualRemoteUs : (0.2 * actualRemoteUs + 0.8 * entry.emaRemoteUs);
+    entry.emaWallUs   = (entry.emaWallUs <= 0.0)   ? actualWallUs   : (0.2 * actualWallUs   + 0.8 * entry.emaWallUs);
+
+    double totalTime = entry.emaLocalUs + entry.emaRemoteUs;
+    if (totalTime > 0.0) {
+        // Load imbalance ratio: (local - remote) / total
+        double imbalance = (entry.emaLocalUs - entry.emaRemoteUs) / totalTime;
+        float delta = static_cast<float>(imbalance * learningRate);
+        delta = std::clamp(delta, -0.10f, 0.10f);
+        // If local took longer (imbalance > 0), give local fewer rows (decrease alpha)
+        // If remote took longer (imbalance < 0), give local more rows (increase alpha)
+        entry.calibratedAlpha = std::clamp(entry.calibratedAlpha - delta, 0.05f, 0.95f);
+    }
+
+    ++entry.updateCount;
+    entry.lastAccess = std::chrono::steady_clock::now();
+    ++m_stats.updates;
+    return entry.calibratedAlpha;
+}
+
+void ApronCache::clear() noexcept {
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_entries.clear();
+    m_stats.entryCount = 0;
+}
+
+size_t ApronCache::size() const noexcept {
+    std::lock_guard<std::mutex> lk(m_mu);
+    return m_entries.size();
+}
+
+ApronCacheStats ApronCache::stats() const noexcept {
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_stats.entryCount = m_entries.size();
+    return m_stats;
+}
+
+void ApronCache::resetStats() noexcept {
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_stats = ApronCacheStats{};
+    m_stats.entryCount = m_entries.size();
+}
+
+// ─── WorkloadPartitioner Methods ─────────────────────────────────────────────
+
+uint32_t WorkloadPartitioner::getApronRadiusForTask(protocol::TaskType type, uint32_t intensity) noexcept {
+    switch (type) {
+    case protocol::TaskType::Blur: {
+        uint32_t r = intensity & 0xFFu;
+        return (r > 0) ? r : 9u;
+    }
+    case protocol::TaskType::EdgeDetection:
+        return 1u;
+    default:
+        return 9u;
+    }
+}
+
+ApronCache& WorkloadPartitioner::globalApronCache() noexcept {
+    static ApronCache s_cache;
+    return s_cache;
+}
+
 PartitionDecision
 WorkloadPartitioner::calculateOptimalDecision(uint32_t width,
                                              uint32_t height,
@@ -25,12 +170,18 @@ WorkloadPartitioner::calculateOptimalDecision(uint32_t width,
                                              float compressionRatioRecv,
                                              uint32_t apronRadius,
                                              double compressCpuUsPerByte,
-                                             double decompressCpuUsPerByte) noexcept {
+                                             double decompressCpuUsPerByte,
+                                             protocol::TaskType type,
+                                             ApronCache* cache) noexcept {
     PartitionDecision decision;
     if (width == 0 || height == 0 || localGpuTotalUs <= 0.0) {
         decision.splitRatio = 0.50f;
         decision.rationale = "Invalid parameters, default 50/50";
         return decision;
+    }
+
+    if (apronRadius == 0) {
+        apronRadius = getApronRadiusForTask(type);
     }
 
     if (linkBandwidthBps == 0) linkBandwidthBps = 12'500'000;
@@ -39,6 +190,12 @@ WorkloadPartitioner::calculateOptimalDecision(uint32_t width,
     decision.effectiveCompressionRatio = compressionRatio;
     decision.effectiveCompressionRatioRecv = compressionRatioRecv;
     decision.predictedSingleGpuUs = localGpuTotalUs;
+
+    // Check ApronCache for pre-calibrated split ratio
+    std::optional<float> cachedAlpha;
+    if (cache) {
+        cachedAlpha = cache->lookupAlpha(type, width, height, linkBandwidthBps);
+    }
 
     const double totalPixels = static_cast<double>(width) * height;
     const double tLocalPx = localGpuTotalUs / totalPixels;
@@ -136,6 +293,14 @@ WorkloadPartitioner::calculateOptimalDecision(uint32_t width,
         }
     }
 
+    // If cache contained a calibrated alpha that beats or refines the analytical split,
+    // factor in calibrated convergence
+    if (cachedAlpha.has_value() && bestF < 0.99f) {
+        float calAlpha = cachedAlpha.value();
+        // Blend analytical bestF with empirical cachedAlpha (70% empirical calibrated, 30% analytical)
+        bestF = 0.70f * calAlpha + 0.30f * bestF;
+    }
+
     // Check if optimal candidate is faster than fastest single GPU by at least 2%
     if (bestF < 0.99f && minPredictedWallUs < localGpuTotalUs * 0.98) {
         decision = bestCand;
@@ -143,9 +308,15 @@ WorkloadPartitioner::calculateOptimalDecision(uint32_t width,
         decision.isLocalFallback = false;
         decision.predictedSpeedupVsBestGpu = localGpuTotalUs / minPredictedWallUs;
         decision.rationale = std::format(
-            "Cooperative split selected ({:.1f}% Local, {:.1f}% Remote): predicted wall-clock {:.2f} ms vs {:.2f} ms local ({:.2f}x speedup).",
+            "Cooperative split selected ({:.1f}% Local, {:.1f}% Remote): predicted wall-clock {:.2f} ms vs {:.2f} ms local ({:.2f}x speedup){}.",
             decision.splitRatio * 100.0f, (1.0f - decision.splitRatio) * 100.0f,
-            minPredictedWallUs / 1000.0, localGpuTotalUs / 1000.0, decision.predictedSpeedupVsBestGpu);
+            minPredictedWallUs / 1000.0, localGpuTotalUs / 1000.0, decision.predictedSpeedupVsBestGpu,
+            cachedAlpha.has_value() ? " [Calibrated from ApronCache]" : "");
+
+        if (cache) {
+            cache->put(type, width, height, linkBandwidthBps, decision.splitRatio, apronRadius,
+                       decision.predictedLocalUs, decision.predictedRemoteUs, decision.predictedWallClockUs);
+        }
     } else {
         decision = bestCand;
         decision.splitRatio = 1.0f;
@@ -168,11 +339,13 @@ float WorkloadPartitioner::calculateOptimalSplitRatio(uint32_t width,
                                                       double remoteGpuTotalUs,
                                                       uint64_t linkBandwidthBps,
                                                       uint64_t baseRttUs,
-                                                      float compressionRatio) noexcept {
+                                                      float compressionRatio,
+                                                      uint32_t apronRadius) noexcept {
     if (width == 0 || height == 0 || localGpuTotalUs <= 0.0) {
         return 0.50f;
     }
 
+    if (apronRadius == 0) apronRadius = 9;
     if (linkBandwidthBps == 0) linkBandwidthBps = 12'500'000;
     if (compressionRatio <= 0.05f) compressionRatio = 1.0f;
 
@@ -205,6 +378,10 @@ WorkloadPartitioner::createSlabPartitions(const protocol::TaskRequest& fullReq,
                                           uint32_t apronRadius) {
     const uint32_t fullW = fullReq.width;
     const uint32_t fullH = fullReq.height;
+
+    if (apronRadius == 0) {
+        apronRadius = getApronRadiusForTask(fullReq.type);
+    }
 
     splitRatio = std::clamp(splitRatio, 0.05f, 0.95f);
     uint32_t localCoreH = static_cast<uint32_t>(std::round(static_cast<float>(fullH) * splitRatio));
@@ -300,9 +477,15 @@ WorkloadPartitioner::executeParallelSlabs(const protocol::TaskRequest& fullReq,
                                           LocalExecFn localFn,
                                           RemoteExecFn remoteFn,
                                           float splitRatio,
-                                          uint32_t apronRadius) {
+                                          uint32_t apronRadius,
+                                          ApronCache* cache,
+                                          uint64_t linkBandwidthBps) {
     PartitionResult res;
     auto wallStart = std::chrono::steady_clock::now();
+
+    if (apronRadius == 0) {
+        apronRadius = getApronRadiusForTask(fullReq.type);
+    }
 
     // Local-only fallback (Priority 2)
     if (splitRatio >= 0.999f) {
@@ -376,6 +559,15 @@ WorkloadPartitioner::executeParallelSlabs(const protocol::TaskRequest& fullReq,
                                  wallEnd - wallStart).count();
 
     res.success = true;
+
+    // Automatically record runtime feedback to calibrated ApronCache
+    if (cache) {
+        cache->recordFeedback(fullReq.type, fullReq.width, fullReq.height, linkBandwidthBps,
+                             static_cast<double>(res.timing.localTotalUs),
+                             static_cast<double>(res.timing.remoteTotalUs),
+                             static_cast<double>(res.timing.wallClockUs));
+    }
+
     return res;
 }
 
