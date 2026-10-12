@@ -1,6 +1,7 @@
 # scripts/update_laptop_b.ps1
-# Runs on Laptop B to download the latest precompiled release from GitHub and start the worker daemon.
+# Runs on Laptop B to download the latest precompiled release for its active branch and start the worker daemon.
 param(
+    [string]$Branch = "",
     [string]$InstallDir = "$env:USERPROFILE\DistributedGPU_Worker",
     [switch]$StartWorker
 )
@@ -9,11 +10,23 @@ $ErrorActionPreference = "Stop"
 $repoOwner = "CAsishSrinivas"
 $repoName  = "DistributedGPU"
 
+# 1. Detect Branch on this Laptop
+if (-not $Branch) {
+    try {
+        $Branch = (git branch --show-current).Trim()
+    } catch {
+        $Branch = ""
+    }
+}
+if (-not $Branch) {
+    $Branch = "develop" # Default branch
+}
+
 Write-Host "======================================================" -ForegroundColor Cyan
-Write-Host " Fetching Latest DistributedGPU Release from GitHub" -ForegroundColor Cyan
+Write-Host " Fetching Latest Release for Branch: $Branch" -ForegroundColor Cyan
 Write-Host "======================================================" -ForegroundColor Cyan
 
-# 1. Resolve Token from Git Credential Manager or Environment
+# 2. Resolve Token
 $token = $env:GITHUB_TOKEN
 if (-not $token) {
     try {
@@ -34,17 +47,26 @@ if ($token) {
     $headers["Authorization"] = "Bearer $token"
 }
 
-# 2. Query Latest Release
-Write-Host "Querying latest release from GitHub..." -ForegroundColor Yellow
-$release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repoOwner/$repoName/releases/latest" -Headers $headers
-Write-Host "Found Release: $($release.name) ($($release.tag_name))" -ForegroundColor Green
+# 3. Determine Tag for Branch
+$targetTag = if ($Branch -eq "develop") { "develop-latest" } else { "main-latest" }
+Write-Host "Checking release for tag '$targetTag' on GitHub..." -ForegroundColor Yellow
+
+$release = $null
+try {
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repoOwner/$repoName/releases/tags/$targetTag" -Headers $headers -ErrorAction Stop
+} catch {
+    Write-Host "Tag '$targetTag' not found, falling back to latest release..." -ForegroundColor Yellow
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repoOwner/$repoName/releases/latest" -Headers $headers
+}
+
+Write-Host "Found Release: $($release.name) (Tag: $($release.tag_name))" -ForegroundColor Green
 
 $asset = $release.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
 if (-not $asset) {
-    throw "No zip binary asset found in latest release."
+    throw "No zip binary asset found in release for branch '$Branch'."
 }
 
-# 3. Download Release Asset
+# 4. Download Release Asset
 $zipDest = "$env:TEMP\$($asset.name)"
 Write-Host "Downloading $($asset.name)..." -ForegroundColor Yellow
 
@@ -57,9 +79,9 @@ if ($token) {
 }
 
 Invoke-RestMethod -Uri $asset.url -Headers $assetHeaders -OutFile $zipDest
-Write-Host "Download complete: $zipDest" -ForegroundColor Green
+Write-Host "Download complete ($(([System.IO.FileInfo]$zipDest).Length) bytes)" -ForegroundColor Green
 
-# 4. Extract into Installation Directory
+# 5. Extract into Installation Directory
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 }
@@ -70,9 +92,10 @@ Remove-Item $zipDest -Force
 
 Write-Host "`n======================================================" -ForegroundColor Green
 Write-Host " Installation complete at: $InstallDir" -ForegroundColor Green
+Write-Host " Release Branch: $Branch" -ForegroundColor Cyan
 Write-Host "======================================================" -ForegroundColor Green
 
-# 5. Optionally launch worker daemon
+# 6. Optionally launch worker daemon
 if ($StartWorker -or (Test-Path "$InstallDir\bin\worker.exe")) {
     $workerPath = "$InstallDir\bin\worker.exe"
     Write-Host "`nStarting Worker daemon on port 7777..." -ForegroundColor Cyan
