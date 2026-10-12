@@ -726,8 +726,8 @@ void processPipelinedFrame(IDXGISwapChain* pSwapChain) {
                         // Ensure previous upload on GPU has finished before resetting upload allocator
                         if (g_staging.uploadFence && g_staging.uploadFenceValue > 0 &&
                             g_staging.uploadFence->GetCompletedValue() < g_staging.uploadFenceValue) {
-                            g_staging.uploadFence->SetEventOnCompletion(g_staging.uploadFenceValue, g_staging.uploadFenceEvent);
-                            WaitForSingleObject(g_staging.uploadFenceEvent, 50);
+                            g_staging.uploadBuffer->Unmap(0, &writeRange);
+                            return;
                         }
 
                         g_staging.uploadAlloc->Reset();
@@ -804,8 +804,8 @@ void processPipelinedFrame(IDXGISwapChain* pSwapChain) {
     // Verify that the GPU has finished executing commands from the previous use of this ring slot
     if (g_staging.readbackFenceValues[writeIdx] > 0 &&
         g_staging.fence->GetCompletedValue() < g_staging.readbackFenceValues[writeIdx]) {
-        g_staging.fence->SetEventOnCompletion(g_staging.readbackFenceValues[writeIdx], g_staging.fenceEvent);
-        WaitForSingleObject(g_staging.fenceEvent, 50);
+        // Drop capture for this frame rather than stalling Present
+        return;
     }
 
     g_staging.cmdAllocs[writeIdx]->Reset();
