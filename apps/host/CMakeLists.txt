@@ -4,6 +4,7 @@ add_executable(dgpu_host
     job_scheduler.cpp
     workload_cost_model.cpp
     work_distributor.cpp
+    pipeline_executor.cpp
     frame_compositor.cpp
     workload_partitioner.cpp
     statistical_validator.cpp

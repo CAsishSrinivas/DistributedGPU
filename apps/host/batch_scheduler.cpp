@@ -4,6 +4,7 @@
 #include "batch_scheduler.hpp"
 
 #include "frame_compositor.hpp"
+#include "pipeline_executor.hpp"
 #include "work_distributor.hpp"
 
 #include <algorithm>
@@ -377,6 +378,75 @@ AdvancedBatchScheduler::runAllocationSweep(const std::vector<protocol::TaskReque
     }
 
     return sweep;
+}
+
+BatchRunMetrics AdvancedBatchScheduler::runPipelinedBatch(
+    const std::vector<protocol::TaskRequest>& tasks, LocalExecFn localExec, RemoteExecFn remoteExec,
+    bool remoteAvailable, uint32_t inFlightDepth, double referenceHostThroughput,
+    const std::vector<protocol::TaskResult>& referenceResults) {
+
+    uint32_t n = static_cast<uint32_t>(tasks.size());
+    BatchRunMetrics m;
+    m.modeName = std::format("Pipelined Batch (Depth={})", inFlightDepth);
+    m.totalTasks = n;
+    m.taskDetails.resize(n);
+    m.inFlightDepth = inFlightDepth;
+
+    PipelineConfig pcfg;
+    pcfg.inFlightDepth = inFlightDepth;
+    pcfg.overlapCompression = true;
+    pcfg.overlapDecompression = true;
+
+    PipelineExecutor pexec(pcfg);
+    PipelineStageMetrics pmetrics;
+
+    auto batchStart = std::chrono::steady_clock::now();
+    auto results = pexec.executePipeline(tasks, localExec, remoteExec, remoteAvailable, &pmetrics);
+    auto batchEnd = std::chrono::steady_clock::now();
+
+    m.totalWallClockMs = std::chrono::duration<double, std::milli>(batchEnd - batchStart).count();
+    m.throughputTasksPerSec = (n * 1000.0) / (m.totalWallClockMs > 0 ? m.totalWallClockMs : 1.0);
+    m.speedupVsHostAlone = (referenceHostThroughput > 0.0) ? (m.throughputTasksPerSec / referenceHostThroughput) : 1.0;
+    m.overlapFactor = pmetrics.concurrencyFactor;
+    m.pipelineSpeedup = pmetrics.speedupVsSequential;
+
+    std::vector<double> latencies;
+    latencies.reserve(n);
+
+    for (uint32_t i = 0; i < n; ++i) {
+        double latMs = static_cast<double>(results[i].totalUs) / 1000.0;
+        latencies.push_back(latMs);
+
+        m.taskDetails[i].taskId = tasks[i].taskId;
+        m.taskDetails[i].executedOn = remoteAvailable ? "Worker (Pipeline)" : "Host (Pipeline)";
+        m.taskDetails[i].gpuExecutionMs = static_cast<double>(results[i].gpuUs) / 1000.0;
+        m.taskDetails[i].totalTurnaroundMs = latMs;
+        m.taskDetails[i].success = (results[i].status == protocol::TaskStatus::Ok);
+
+        if (results[i].status == protocol::TaskStatus::Ok) {
+            if (remoteAvailable) ++m.workerTasksExecuted;
+            else ++m.hostTasksExecuted;
+        } else {
+            ++m.failedTasks;
+        }
+    }
+
+    m.p50LatencyMs = computePercentile(latencies, 0.50);
+    m.p90LatencyMs = computePercentile(latencies, 0.90);
+    m.p95LatencyMs = computePercentile(latencies, 0.95);
+    m.p99LatencyMs = computePercentile(latencies, 0.99);
+    m.maxLatencyMs = latencies.empty() ? 0.0 : *std::max_element(latencies.begin(), latencies.end());
+
+    // Calculate MAE against reference if available
+    if (referenceResults.size() == n) {
+        double totalMAE = 0.0;
+        for (uint32_t i = 0; i < n; ++i) {
+            totalMAE += FrameCompositor::computeMAE(referenceResults[i].output, results[i].output);
+        }
+        m.maeVsReference = totalMAE / n;
+    }
+
+    return m;
 }
 
 void AdvancedBatchScheduler::printSweepTable(const std::vector<SweepPointResult>& sweep) {

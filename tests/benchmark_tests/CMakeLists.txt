@@ -12,6 +12,7 @@ add_executable(test_partitioner
     ../../apps/host/workload_partitioner.cpp
     ../../apps/host/statistical_validator.cpp
     ../../apps/host/batch_scheduler.cpp
+    ../../apps/host/pipeline_executor.cpp
     ../../apps/host/work_distributor.cpp
     ../../apps/host/workload_cost_model.cpp
     ../../apps/host/frame_compositor.cpp
@@ -38,6 +39,7 @@ add_executable(test_work_stealing
     test_work_stealing.cpp
     ../../apps/host/work_distributor.cpp
     ../../apps/host/batch_scheduler.cpp
+    ../../apps/host/pipeline_executor.cpp
     ../../apps/host/workload_cost_model.cpp
     ../../apps/host/workload_partitioner.cpp
     ../../apps/host/statistical_validator.cpp
@@ -49,3 +51,23 @@ target_link_libraries(test_work_stealing PRIVATE
     dgpu_protocol
 )
 add_test(NAME work_stealing_tests COMMAND test_work_stealing)
+
+add_executable(test_pipeline_transfers
+    test_pipeline_transfers.cpp
+    ../../apps/host/pipeline_executor.cpp
+    ../../apps/host/batch_scheduler.cpp
+    ../../apps/host/work_distributor.cpp
+    ../../apps/host/workload_cost_model.cpp
+    ../../apps/host/workload_partitioner.cpp
+    ../../apps/host/statistical_validator.cpp
+    ../../apps/host/frame_compositor.cpp
+)
+target_include_directories(test_pipeline_transfers PRIVATE ../../apps/host ../.. ../../libs)
+target_link_libraries(test_pipeline_transfers PRIVATE
+    dgpu_compile_options
+    dgpu_protocol
+    dgpu_telemetry
+    $<$<BOOL:${D3D12_AVAILABLE}>:dgpu_d3d12>
+)
+add_test(NAME pipeline_transfers_tests COMMAND test_pipeline_transfers)
+
