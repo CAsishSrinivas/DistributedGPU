@@ -1,7 +1,6 @@
-// networking/tcp_connection.hpp
-// Wraps a Winsock TCP socket with framed message I/O.
 #pragma once
 
+#include "protocol/adaptive_transfer_policy.hpp"
 #include "protocol/message.hpp"
 
 #include <atomic>
@@ -113,9 +112,16 @@ public:
 
     [[nodiscard]] bool isConnected() const noexcept;
 
-    // LZ4 Payload Compression
+    // LZ4 Payload Compression & Adaptive Codec Policy (Phase 2.6)
     void setCompressionEnabled(bool enabled) noexcept;
     [[nodiscard]] bool isCompressionEnabled() const noexcept;
+
+    void setLinkBandwidthBps(uint64_t bps) noexcept;
+    [[nodiscard]] uint64_t linkBandwidthBps() const noexcept;
+
+    void setTransferPolicy(protocol::AdaptiveTransferPolicy policy) noexcept;
+    [[nodiscard]] protocol::AdaptiveTransferPolicy& transferPolicy() noexcept;
+    [[nodiscard]] const protocol::AdaptiveTransferPolicy& transferPolicy() const noexcept;
 
     struct TransferMetrics {
         size_t   uncompressedSendBytes{0};
@@ -126,6 +132,8 @@ public:
         uint64_t decompressionUs{0};
         float    compressionRatioSend{1.0f};
         float    compressionRatioRecv{1.0f};
+        bool     wasCompressed{false};
+        float    estimatedRatio{1.0f};
     };
 
     [[nodiscard]] TransferMetrics lastTransferMetrics() const noexcept;
@@ -135,13 +143,15 @@ public:
     [[nodiscard]] bool hasCapabilities() const noexcept;
 
 private:
-    TcpConnection                m_conn;
-    uint64_t                     m_nextTaskId{1};
-    bool                         m_compressionEnabled{true};
-    TransferMetrics              m_lastMetrics;
-    protocol::WorkerCapabilities m_workerCaps{};
-    bool                         m_hasCaps{false};
-    mutable std::mutex           m_submitMu;
+    TcpConnection                    m_conn;
+    uint64_t                         m_nextTaskId{1};
+    bool                             m_compressionEnabled{true};
+    protocol::AdaptiveTransferPolicy m_policy;
+    uint64_t                         m_linkBandwidthBps{12'500'000};
+    TransferMetrics                  m_lastMetrics;
+    protocol::WorkerCapabilities     m_workerCaps{};
+    bool                             m_hasCaps{false};
+    mutable std::mutex               m_submitMu;
 };
 
 // ─── Winsock RAII guard ───────────────────────────────────────────────────────

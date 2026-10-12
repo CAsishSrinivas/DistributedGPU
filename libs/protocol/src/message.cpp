@@ -37,7 +37,7 @@ static uint16_t hton16(uint16_t v) noexcept {
     return __builtin_bswap16(v);
 #endif
 }
-static uint16_t ntoh16(uint16_t v) noexcept { return hton16(v); }
+[[maybe_unused]] static uint16_t ntoh16(uint16_t v) noexcept { return hton16(v); }
 
 // ─── Serialisation helpers ────────────────────────────────────────────────────
 
