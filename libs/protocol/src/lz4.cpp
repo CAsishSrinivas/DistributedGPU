@@ -49,7 +49,6 @@ size_t lz4Compress(const void* src, size_t srcSize, void* dst, size_t dstCapacit
     const auto* anchor = ip;
 
     auto* op       = static_cast<uint8_t*>(dst);
-    auto* const oend = op + dstCapacity;
 
     if (srcSize < 13) {
         // Too small to compress; write single literal block

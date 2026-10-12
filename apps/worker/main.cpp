@@ -2,8 +2,12 @@
 // Worker process: initialises the GTX 1650 Ti, listens for task submissions,
 // executes them on the GPU, and returns results with timing breakdowns.
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <objbase.h>
 
@@ -96,7 +100,7 @@ static void handleConnection(dgpu::networking::TcpConnection conn,
         std::cerr << "[worker] Handshake rejected: invalid header from " << conn.peerAddress()
                   << " (magic=0x" << std::hex << magic << " type=0x" << msgType << std::dec << ")\n";
         auto err = Message::makeTaskError(0, TaskStatus::InvalidRequest);
-        conn.sendMessage(err);
+        (void)conn.sendMessage(err);
         return;
     }
 
@@ -108,7 +112,7 @@ static void handleConnection(dgpu::networking::TcpConnection conn,
     } catch (const std::exception& e) {
         std::cerr << "[worker] Malformed HELLO payload from " << conn.peerAddress() << ": " << e.what() << '\n';
         auto err = Message::makeTaskError(0, TaskStatus::InvalidRequest);
-        conn.sendMessage(err);
+        (void)conn.sendMessage(err);
         return;
     }
 
@@ -144,7 +148,7 @@ static void handleConnection(dgpu::networking::TcpConnection conn,
             std::memcpy(&tid, &msg.header.taskId, sizeof(tid));
             tid = _byteswap_uint64(tid);
             auto pong = Message::makePong(tid);
-            conn.sendMessage(pong);
+            (void)conn.sendMessage(pong);
             continue;
         }
 
@@ -185,7 +189,7 @@ static void handleConnection(dgpu::networking::TcpConnection conn,
                 resp.header.status      = _byteswap_ulong(
                     static_cast<uint32_t>(TaskStatus::InvalidRequest));
                 resp.payload            = std::move(pl);
-                conn.sendMessage(resp);
+                (void)conn.sendMessage(resp);
                 continue;
             }
 
@@ -209,7 +213,7 @@ static void handleConnection(dgpu::networking::TcpConnection conn,
                 resp.header.status      = _byteswap_ulong(
                     static_cast<uint32_t>(TaskStatus::UnsupportedTask));
                 resp.payload            = std::move(pl);
-                conn.sendMessage(resp);
+                (void)conn.sendMessage(resp);
                 continue;
             }
 
@@ -256,7 +260,7 @@ static void handleConnection(dgpu::networking::TcpConnection conn,
                 dgpu::protocol::setHeaderFlag(resp.header, dgpu::protocol::FLAG_COMPRESSED);
             }
             resp.payload            = std::move(pl);
-            conn.sendMessage(resp);
+            (void)conn.sendMessage(resp);
             continue;
         }
 
@@ -365,7 +369,7 @@ int main(int argc, char* argv[]) {
     // Populate worker capabilities
     const auto& adapter = executor.adapterInfo();
     s_workerCaps.workerId = getOrCreateWorkerId();
-    char hostBuf[256];
+    char hostBuf[256] = {};
     DWORD hostLen = sizeof(hostBuf);
     if (GetComputerNameA(hostBuf, &hostLen)) {
         s_workerCaps.hostname = hostBuf;

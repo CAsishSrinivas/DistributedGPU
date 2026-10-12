@@ -3,8 +3,12 @@
 // and verifies the echo (server echoes the task_id back).
 // No GPU required.
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -45,7 +49,7 @@ static void echoHandler(TcpConnection conn) {
     Message msg;
     while (conn.receiveMessage(msg)) {
         // Reflect the same message back so the client can correlate task IDs
-        conn.sendMessage(msg);
+        (void)conn.sendMessage(msg);
     }
 }
 
@@ -283,7 +287,7 @@ static void test_worker_capabilities_negotiation() {
                 uint64_t tid = 0;
                 std::memcpy(&tid, &msg.header.taskId, sizeof(tid));
                 auto pong = Message::makePong(_byteswap_uint64(tid));
-                conn.sendMessage(pong);
+                (void)conn.sendMessage(pong);
                 continue;
             }
 
@@ -304,7 +308,7 @@ static void test_worker_capabilities_negotiation() {
                 resp.header.payloadSize = _byteswap_ulong(static_cast<uint32_t>(pl.size()));
                 resp.header.status      = 0;
                 resp.payload            = std::move(pl);
-                conn.sendMessage(resp);
+                (void)conn.sendMessage(resp);
             }
         }
     }));
@@ -367,12 +371,12 @@ static void test_health_monitor_state_transitions() {
                 msgType = _byteswap_ushort(msgType);
                 if (msgType == static_cast<uint16_t>(MessageType::Hello)) {
                     auto ack = Message::makeHelloAck("WorkerB", "MockGPU", 4096);
-                    conn.sendMessage(ack);
+                    (void)conn.sendMessage(ack);
                 } else if (msgType == static_cast<uint16_t>(MessageType::Ping)) {
                     uint64_t tid = 0;
                     std::memcpy(&tid, &msg.header.taskId, sizeof(tid));
                     auto pong = Message::makePong(_byteswap_uint64(tid));
-                    conn.sendMessage(pong);
+                    (void)conn.sendMessage(pong);
                 }
             }
         };
@@ -477,7 +481,7 @@ static void test_adaptive_transfer_policy_client() {
                 uint64_t tid = 0;
                 std::memcpy(&tid, &msg.header.taskId, sizeof(tid));
                 auto pong = Message::makePong(_byteswap_uint64(tid));
-                conn.sendMessage(pong);
+                (void)conn.sendMessage(pong);
                 continue;
             }
 
@@ -515,7 +519,7 @@ static void test_adaptive_transfer_policy_client() {
             resp.header.taskId      = _byteswap_uint64(req.taskId);
             resp.header.payloadSize = _byteswap_ulong(static_cast<uint32_t>(pl.size()));
             resp.payload            = std::move(pl);
-            conn.sendMessage(resp);
+            (void)conn.sendMessage(resp);
         }
     }));
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -665,7 +669,7 @@ static void test_task_client_with_endpoint_config() {
                 uint64_t tid = 0;
                 std::memcpy(&tid, &msg.header.taskId, sizeof(tid));
                 auto pong = Message::makePong(_byteswap_uint64(tid));
-                conn.sendMessage(pong);
+                (void)conn.sendMessage(pong);
             } else if (msgType == static_cast<uint16_t>(MessageType::SubmitTask)) {
                 uint64_t tid = 0;
                 std::memcpy(&tid, &msg.header.taskId, sizeof(tid));
@@ -680,7 +684,7 @@ static void test_task_client_with_endpoint_config() {
                 resp.header.taskId = _byteswap_uint64(tid);
                 resp.payload = res.serialise();
                 resp.header.payloadSize = _byteswap_ulong(static_cast<uint32_t>(resp.payload.size()));
-                conn.sendMessage(resp);
+                (void)conn.sendMessage(resp);
             }
         }
     }));
@@ -765,7 +769,7 @@ static void test_reconnect_behavior_with_endpoint_config() {
         Message hello;
         if (!conn.receiveMessage(hello)) return;
         auto ack = Message::makeHelloAck("Worker", "Reconnected-GPU", 4096, caps);
-        conn.sendMessage(ack);
+        (void)conn.sendMessage(ack);
     }));
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 

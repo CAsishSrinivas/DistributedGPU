@@ -3,8 +3,12 @@
 // Validates cooperative distributed rendering against unmodified baseline:
 // measures avg FPS, 1% low FPS, frame-time variance, and worker recovery.
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 
 #include "d3d12_game_hook.hpp"
@@ -101,10 +105,10 @@ int main(int argc, char* argv[]) {
     dgpu::d3d12::D3D12Context d3dCtx;
     if (d3dCtx.init("RTX 3050")) {
         std::cout << "[game_adapter] Initialised D3D12 staging pipeline on " << d3dCtx.adapterInfo().name << '\n';
-        adapter.init(d3dCtx.device(), OFFLOAD_WIDTH, OFFLOAD_HEIGHT);
+        (void)adapter.init(d3dCtx.device(), OFFLOAD_WIDTH, OFFLOAD_HEIGHT);
     } else {
         std::cout << "[game_adapter] D3D12Context fallback to software staging\n";
-        adapter.init(nullptr, OFFLOAD_WIDTH, OFFLOAD_HEIGHT);
+        (void)adapter.init(nullptr, OFFLOAD_WIDTH, OFFLOAD_HEIGHT);
     }
 
     dgpu::game_adapter::FramePacer baselinePacer;
@@ -146,7 +150,7 @@ int main(int argc, char* argv[]) {
     // Seed pipeline with frame 0
     auto prevFrameBuf = renderGameScene(GAME_WIDTH, GAME_HEIGHT, 0);
     auto prevInter    = renderGameScene(OFFLOAD_WIDTH, OFFLOAD_HEIGHT, 0);
-    adapter.submitPostProcess(prevInter, OFFLOAD_WIDTH, OFFLOAD_HEIGHT, scheduler);
+    (void)adapter.submitPostProcess(prevInter, OFFLOAD_WIDTH, OFFLOAD_HEIGHT, scheduler);
 
     for (uint32_t f = 1; f <= BENCHMARK_FRAMES; ++f) {
         auto tStart = std::chrono::steady_clock::now();
@@ -171,7 +175,7 @@ int main(int argc, char* argv[]) {
 
         // Submit frame f to worker for next cycle
         if (f < BENCHMARK_FRAMES) {
-            adapter.submitPostProcess(currInter, OFFLOAD_WIDTH, OFFLOAD_HEIGHT, scheduler);
+            (void)adapter.submitPostProcess(currInter, OFFLOAD_WIDTH, OFFLOAD_HEIGHT, scheduler);
             prevFrameBuf = std::move(currFrameBuf);
         }
     }
@@ -186,8 +190,8 @@ int main(int argc, char* argv[]) {
     auto recStart = std::chrono::steady_clock::now();
     auto recFrame = renderGameScene(GAME_WIDTH, GAME_HEIGHT, 999);
     auto recInter = renderGameScene(OFFLOAD_WIDTH, OFFLOAD_HEIGHT, 999);
-    adapter.submitPostProcess(recInter, OFFLOAD_WIDTH, OFFLOAD_HEIGHT, scheduler);
-    adapter.syncAndComposite(recFrame, GAME_WIDTH, GAME_HEIGHT, compositor);
+    (void)adapter.submitPostProcess(recInter, OFFLOAD_WIDTH, OFFLOAD_HEIGHT, scheduler);
+    (void)adapter.syncAndComposite(recFrame, GAME_WIDTH, GAME_HEIGHT, compositor);
     auto recEnd = std::chrono::steady_clock::now();
     uint64_t recUs = std::chrono::duration_cast<std::chrono::microseconds>(recEnd - recStart).count();
 

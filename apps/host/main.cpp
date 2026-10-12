@@ -4,8 +4,12 @@
 // composites frames via FrameCompositor, schedules adaptively via JobScheduler,
 // and produces the complete M4/M5 distributed rendering benchmark report.
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 
 #include "networking/tcp_connection.hpp"
@@ -69,7 +73,6 @@ static constexpr std::array<BenchConfig, 4> kBenchConfigs{{
 
 static std::vector<std::byte> renderHostScene(uint32_t width, uint32_t height, uint32_t frameIdx, int sceneType = 0) {
     std::vector<std::byte> frame(static_cast<size_t>(width) * height * 4);
-    const uint8_t pulse = static_cast<uint8_t>(128.0 + 60.0 * std::sin(frameIdx * 0.1f));
 
     if (sceneType == 1) { // High-frequency pseudo-random noise (low compressibility, ~1.0x ratio)
         for (uint32_t y = 0; y < height; ++y) {
@@ -224,7 +227,7 @@ static void runDistributedBenchmark(const BenchConfig& cfg,
 
             // 3. Composite post-processed result over base frame
             auto compStart = std::chrono::steady_clock::now();
-            compositor.composite(baseFrame, result.output, cfg.width, cfg.height,
+            (void)compositor.composite(baseFrame, result.output, cfg.width, cfg.height,
                                  host::CompositeMode::AlphaBlend, 0.75f);
             auto compEnd   = std::chrono::steady_clock::now();
             uint64_t compUs = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -292,7 +295,7 @@ static void runDistributedBenchmark(const BenchConfig& cfg,
             uint64_t netUs = (roundTripUs > result.totalUs) ? (roundTripUs - result.totalUs) : 0;
 
             auto compStart = std::chrono::steady_clock::now();
-            compositor.composite(baseFrame, result.output, cfg.width, cfg.height,
+            (void)compositor.composite(baseFrame, result.output, cfg.width, cfg.height,
                                  host::CompositeMode::AlphaBlend, 0.75f);
             auto compEnd   = std::chrono::steady_clock::now();
             uint64_t compUs = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -365,7 +368,7 @@ static void runDistributedBenchmark(const BenchConfig& cfg,
             auto prevResult = inFlightJob.future.get();
 
             // 3. Composite frame i-1
-            compositor.composite(prevBaseFrame, prevResult.output, cfg.width, cfg.height,
+            (void)compositor.composite(prevBaseFrame, prevResult.output, cfg.width, cfg.height,
                                  host::CompositeMode::AlphaBlend, 0.75f);
 
             auto frameEnd = std::chrono::steady_clock::now();
@@ -424,7 +427,7 @@ static void runDistributedBenchmark(const BenchConfig& cfg,
             auto job    = scheduler.submit(std::move(req));
             auto result = job.future.get();
 
-            compositor.composite(baseFrame, result.output, cfg.width, cfg.height,
+            (void)compositor.composite(baseFrame, result.output, cfg.width, cfg.height,
                                  host::CompositeMode::AlphaBlend, 0.75f);
 
             auto frameEnd = std::chrono::steady_clock::now();
