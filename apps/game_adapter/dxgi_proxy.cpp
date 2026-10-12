@@ -275,24 +275,39 @@ inline uint16_t floatToHalf(float f) {
 
 // ─── D3D12 Staging Resources for Backbuffer Capture & Writeback ──────────────
 struct D3D12StagingResources {
-    static constexpr uint32_t RING_SIZE = 3;
+    static constexpr uint32_t RING_SIZE = 4;
     ComPtr<ID3D12CommandAllocator>    cmdAllocs[RING_SIZE];
     ComPtr<ID3D12GraphicsCommandList> cmdLists[RING_SIZE];
     ComPtr<ID3D12Fence>               fence;
+    HANDLE                            fenceEvent{nullptr};
     UINT64                            fenceValue{0};
-    UINT64                            readbackFenceValues[RING_SIZE]{0, 0, 0};
+    UINT64                            readbackFenceValues[RING_SIZE]{0, 0, 0, 0};
     ComPtr<ID3D12Resource>            readbackBuffers[RING_SIZE];
     uint32_t                          ringIdx{0};
 
     ComPtr<ID3D12Resource>            uploadBuffer;
     ComPtr<ID3D12CommandAllocator>    uploadAlloc;
     ComPtr<ID3D12GraphicsCommandList> uploadCmdList;
+    ComPtr<ID3D12Fence>               uploadFence;
+    HANDLE                            uploadFenceEvent{nullptr};
+    UINT64                            uploadFenceValue{0};
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT64                            totalSize{0};
     uint32_t                          width{0};
     uint32_t                          height{0};
     DXGI_FORMAT                       format{DXGI_FORMAT_UNKNOWN};
     bool                              valid{false};
+
+    ~D3D12StagingResources() {
+        if (fenceEvent) {
+            CloseHandle(fenceEvent);
+            fenceEvent = nullptr;
+        }
+        if (uploadFenceEvent) {
+            CloseHandle(uploadFenceEvent);
+            uploadFenceEvent = nullptr;
+        }
+    }
 
     bool ensure(ID3D12Device* device, ID3D12CommandQueue* queue, uint32_t w, uint32_t h, DXGI_FORMAT fmt) {
         if (valid && width == w && height == h && format == fmt) {
@@ -356,6 +371,9 @@ struct D3D12StagingResources {
             if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
                 return false;
         }
+        if (!fenceEvent) {
+            fenceEvent = CreateEventEx(nullptr, nullptr, false, EVENT_ALL_ACCESS);
+        }
         fenceValue = 0;
         for (uint32_t i = 0; i < RING_SIZE; ++i) {
             readbackFenceValues[i] = 0;
@@ -379,6 +397,13 @@ struct D3D12StagingResources {
             device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, uploadAlloc.Get(), nullptr, IID_PPV_ARGS(&uploadCmdList));
             uploadCmdList->Close();
         }
+        if (!uploadFence) {
+            device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&uploadFence));
+        }
+        if (!uploadFenceEvent) {
+            uploadFenceEvent = CreateEventEx(nullptr, nullptr, false, EVENT_ALL_ACCESS);
+        }
+        uploadFenceValue = 0;
 
         valid = true;
         ringIdx = 0;
@@ -666,6 +691,13 @@ void processPipelinedFrame(IDXGISwapChain* pSwapChain) {
                         }
                         g_staging.uploadBuffer->Unmap(0, &writeRange);
 
+                        // Ensure previous upload on GPU has finished before resetting upload allocator
+                        if (g_staging.uploadFence && g_staging.uploadFenceValue > 0 &&
+                            g_staging.uploadFence->GetCompletedValue() < g_staging.uploadFenceValue) {
+                            g_staging.uploadFence->SetEventOnCompletion(g_staging.uploadFenceValue, g_staging.uploadFenceEvent);
+                            WaitForSingleObject(g_staging.uploadFenceEvent, 50);
+                        }
+
                         g_staging.uploadAlloc->Reset();
                         g_staging.uploadCmdList->Reset(g_staging.uploadAlloc.Get(), nullptr);
 
@@ -700,13 +732,16 @@ void processPipelinedFrame(IDXGISwapChain* pSwapChain) {
                         g_staging.uploadCmdList->Close();
                         ID3D12CommandList* lists[] = { g_staging.uploadCmdList.Get() };
                         queue->ExecuteCommandLists(1, lists);
+
+                        UINT64 upFence = ++g_staging.uploadFenceValue;
+                        queue->Signal(g_staging.uploadFence.Get(), upFence);
                     }
                 }
             }
         } else {
             auto now = std::chrono::steady_clock::now();
             auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - front.submitTime).count();
-            if (elapsedMs > 500) {
+            if (elapsedMs > 3000) {
                 logMsg("[dgpu_dxgi] WARNING: In-flight task timed out (" + std::to_string(elapsedMs) + "ms); resetting connection.");
                 g_workerClient.disconnect();
                 g_inFlightQueue.pop_front();
@@ -715,8 +750,8 @@ void processPipelinedFrame(IDXGISwapChain* pSwapChain) {
         }
     }
 
-    // Multi-frame pipeline: allow up to 2 frames in flight to absorb network fluctuations
-    if (g_inFlightQueue.size() >= 2) {
+    // Multi-frame pipeline: allow up to 4 frames in flight to absorb network fluctuations and eliminate GPU idle bubbles
+    if (g_inFlightQueue.size() >= 4) {
         return;
     }
 
@@ -729,10 +764,17 @@ void processPipelinedFrame(IDXGISwapChain* pSwapChain) {
         return;
     }
 
-    // 5. Asynchronous zero-stall triple-buffered ring buffer copy (N-2 readback)
+    // 5. Asynchronous zero-stall ring buffer copy
     uint32_t writeIdx = g_staging.ringIdx;
     uint32_t readIdx  = (g_staging.ringIdx + 1) % D3D12StagingResources::RING_SIZE;
     g_staging.ringIdx = (g_staging.ringIdx + 1) % D3D12StagingResources::RING_SIZE;
+
+    // Verify that the GPU has finished executing commands from the previous use of this ring slot
+    if (g_staging.readbackFenceValues[writeIdx] > 0 &&
+        g_staging.fence->GetCompletedValue() < g_staging.readbackFenceValues[writeIdx]) {
+        g_staging.fence->SetEventOnCompletion(g_staging.readbackFenceValues[writeIdx], g_staging.fenceEvent);
+        WaitForSingleObject(g_staging.fenceEvent, 50);
+    }
 
     g_staging.cmdAllocs[writeIdx]->Reset();
     g_staging.cmdLists[writeIdx]->Reset(g_staging.cmdAllocs[writeIdx].Get(), nullptr);
@@ -773,10 +815,13 @@ void processPipelinedFrame(IDXGISwapChain* pSwapChain) {
     g_staging.readbackFenceValues[writeIdx] = currentFence;
     queue->Signal(g_staging.fence.Get(), currentFence);
 
-    // 6. Zero-stall extraction from buffer submitted 2 frames ago (readIdx)
-    // Buffer N-2 finished rendering on the GPU ~33ms ago, so it is 100% completed!
-    if (g_staging.readbackFenceValues[readIdx] > 0 &&
-        g_staging.fence->GetCompletedValue() >= g_staging.readbackFenceValues[readIdx]) {
+    // 6. Zero-stall extraction from buffer submitted frames ago (readIdx)
+    if (g_staging.readbackFenceValues[readIdx] == 0) {
+        // Initial warm-up frames: ring buffer has not yet circled
+        return;
+    }
+
+    if (g_staging.fence->GetCompletedValue() >= g_staging.readbackFenceValues[readIdx]) {
         void* mapped = nullptr;
         D3D12_RANGE readRange{ 0, static_cast<SIZE_T>(g_staging.totalSize) };
         if (SUCCEEDED(g_staging.readbackBuffers[readIdx]->Map(0, &readRange, &mapped)) && mapped) {
