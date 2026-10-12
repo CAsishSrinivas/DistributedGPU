@@ -428,9 +428,19 @@ protocol::TaskResult TaskClient::submit(const protocol::TaskRequest& req) {
     TransferMetrics tm;
     tm.uncompressedSendBytes = payload.size();
 
+    bool doCompress = false;
+    float estRatio = 1.0f;
     if (m_compressionEnabled) {
+        auto eval = m_policy.evaluate(payload, m_linkBandwidthBps);
+        doCompress = (eval.decision == protocol::CodecDecision::Compress);
+        estRatio = eval.estimatedRatio;
+    }
+    tm.estimatedRatio = estRatio;
+
+    if (doCompress) {
         msg.header.messageType = _byteswap_ushort(
             static_cast<uint16_t>(protocol::MessageType::SubmitTaskCompressed));
+        protocol::setHeaderFlag(msg.header, protocol::FLAG_COMPRESSED);
         auto c0 = std::chrono::steady_clock::now();
         msg.payload = protocol::compressBuffer(payload);
         auto c1 = std::chrono::steady_clock::now();
@@ -440,12 +450,15 @@ protocol::TaskResult TaskClient::submit(const protocol::TaskRequest& req) {
         tm.compressionRatioSend = (tm.compressedSendBytes > 0)
                                       ? static_cast<float>(tm.uncompressedSendBytes) / static_cast<float>(tm.compressedSendBytes)
                                       : 1.0f;
+        tm.wasCompressed = true;
+        m_policy.recordCompression(tm.uncompressedSendBytes, tm.compressedSendBytes, tm.compressionUs);
     } else {
         msg.header.messageType = _byteswap_ushort(
             static_cast<uint16_t>(protocol::MessageType::SubmitTask));
         msg.payload = std::move(payload);
         tm.compressedSendBytes = tm.uncompressedSendBytes;
         tm.compressionRatioSend = 1.0f;
+        tm.wasCompressed = false;
     }
     msg.header.payloadSize = _byteswap_ulong(static_cast<uint32_t>(msg.payload.size()));
 
@@ -500,10 +513,11 @@ protocol::TaskResult TaskClient::submit(const protocol::TaskRequest& req) {
         return err;
     }
 
-    if (msgType == protocol::MessageType::TaskError || respStatus != 0) {
+    uint32_t statusCode = respStatus & protocol::FLAG_STATUS_MASK;
+    if (msgType == protocol::MessageType::TaskError || statusCode != 0) {
         protocol::TaskResult err;
         err.taskId = req.taskId;
-        err.status = (respStatus != 0) ? static_cast<protocol::TaskStatus>(respStatus)
+        err.status = (statusCode != 0) ? static_cast<protocol::TaskStatus>(statusCode)
                                        : protocol::TaskStatus::InternalError;
         return err;
     }
@@ -512,7 +526,10 @@ protocol::TaskResult TaskClient::submit(const protocol::TaskRequest& req) {
         std::span<const std::byte> payloadSpan = resp.payload;
         std::vector<std::byte> decomp;
 
-        if (msgType == protocol::MessageType::TaskResultCompressed) {
+        bool isRespCompressed = (msgType == protocol::MessageType::TaskResultCompressed) ||
+                                protocol::hasHeaderFlag(resp.header, protocol::FLAG_COMPRESSED);
+
+        if (isRespCompressed) {
             if (resp.payload.size() < 4) {
                 throw std::runtime_error("Compressed task result payload too short");
             }
@@ -530,6 +547,7 @@ protocol::TaskResult TaskClient::submit(const protocol::TaskRequest& req) {
             tm.compressionRatioRecv = (tm.compressedRecvBytes > 0)
                                           ? static_cast<float>(tm.uncompressedRecvBytes) / static_cast<float>(tm.compressedRecvBytes)
                                           : 1.0f;
+            m_policy.recordDecompression(tm.uncompressedRecvBytes, tm.compressedRecvBytes, tm.decompressionUs);
             payloadSpan = decomp;
         } else {
             tm.compressedRecvBytes = resp.payload.size();
@@ -590,6 +608,31 @@ void TaskClient::setCompressionEnabled(bool enabled) noexcept {
 bool TaskClient::isCompressionEnabled() const noexcept {
     std::lock_guard<std::mutex> lk(m_submitMu);
     return m_compressionEnabled;
+}
+
+void TaskClient::setLinkBandwidthBps(uint64_t bps) noexcept {
+    std::lock_guard<std::mutex> lk(m_submitMu);
+    m_linkBandwidthBps = bps;
+}
+
+uint64_t TaskClient::linkBandwidthBps() const noexcept {
+    std::lock_guard<std::mutex> lk(m_submitMu);
+    return m_linkBandwidthBps;
+}
+
+void TaskClient::setTransferPolicy(protocol::AdaptiveTransferPolicy policy) noexcept {
+    std::lock_guard<std::mutex> lk(m_submitMu);
+    m_policy = std::move(policy);
+}
+
+protocol::AdaptiveTransferPolicy& TaskClient::transferPolicy() noexcept {
+    std::lock_guard<std::mutex> lk(m_submitMu);
+    return m_policy;
+}
+
+const protocol::AdaptiveTransferPolicy& TaskClient::transferPolicy() const noexcept {
+    std::lock_guard<std::mutex> lk(m_submitMu);
+    return m_policy;
 }
 
 TaskClient::TransferMetrics TaskClient::lastTransferMetrics() const noexcept {

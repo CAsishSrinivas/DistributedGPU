@@ -98,11 +98,53 @@ struct MessageHeader {
     uint16_t messageType;  // MessageType cast to uint16_t
     uint64_t taskId;       // Correlation ID (0 for control messages)
     uint32_t payloadSize;  // Byte count of the payload that follows
-    uint32_t status;       // TaskStatus cast to uint32_t
+    uint32_t status;       // TaskStatus (low 16 bits) and header flags (high 16 bits)
 };
 #pragma pack(pop)
 
 static_assert(sizeof(MessageHeader) == 24, "MessageHeader must be exactly 24 bytes");
+
+// ─── Header Flags (Phase 2.6) ────────────────────────────────────────────────
+inline constexpr uint32_t FLAG_NONE        = 0x00000000u;
+inline constexpr uint32_t FLAG_COMPRESSED  = 0x80000000u; // Payload is LZ4 compressed
+inline constexpr uint32_t FLAG_BATCHED     = 0x40000000u; // Payload contains batched task messages
+inline constexpr uint32_t FLAG_STATUS_MASK = 0x0000FFFFu;
+
+[[nodiscard]] inline bool hasHeaderFlag(const MessageHeader& hdr, uint32_t flag) noexcept {
+    uint32_t s = hdr.status;
+#if defined(_WIN32)
+    s = _byteswap_ulong(s);
+#else
+    s = __builtin_bswap32(s);
+#endif
+    return (s & flag) == flag;
+}
+[[nodiscard]] inline bool hasHeaderFlag(uint32_t hostStatus, uint32_t flag) noexcept {
+    return (hostStatus & flag) == flag;
+}
+inline void setHeaderFlag(MessageHeader& hdr, uint32_t flag) noexcept {
+    uint32_t s = hdr.status;
+#if defined(_WIN32)
+    s = _byteswap_ulong(s);
+#else
+    s = __builtin_bswap32(s);
+#endif
+    s |= flag;
+#if defined(_WIN32)
+    hdr.status = _byteswap_ulong(s);
+#else
+    hdr.status = __builtin_bswap32(s);
+#endif
+}
+[[nodiscard]] inline TaskStatus getHeaderStatus(const MessageHeader& hdr) noexcept {
+    uint32_t s = hdr.status;
+#if defined(_WIN32)
+    s = _byteswap_ulong(s);
+#else
+    s = __builtin_bswap32(s);
+#endif
+    return static_cast<TaskStatus>(s & FLAG_STATUS_MASK);
+}
 
 // ─── High-level message ───────────────────────────────────────────────────────
 

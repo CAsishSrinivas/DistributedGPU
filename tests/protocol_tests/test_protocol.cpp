@@ -4,6 +4,7 @@
 
 #include "protocol/message.hpp"
 #include "protocol/lz4.hpp"
+#include "protocol/adaptive_transfer_policy.hpp"
 
 #include <cassert>
 #include <cstdio>
@@ -343,6 +344,135 @@ static void test_hello_v1_backward_compatibility() {
     CHECK(hp.capabilities.supportsTask(TaskType::EdgeDetection, 1920, 1080));
 }
 
+// ─── Phase 2.6 Tests: Header Flags, Adaptive Policy, & Batching ──────────────
+
+static void test_header_flags() {
+    MessageHeader hdr{};
+    CHECK(!hasHeaderFlag(hdr, FLAG_COMPRESSED));
+    CHECK(!hasHeaderFlag(hdr, FLAG_BATCHED));
+    CHECK(getHeaderStatus(hdr) == TaskStatus::Ok);
+
+    setHeaderFlag(hdr, FLAG_COMPRESSED);
+    CHECK(hasHeaderFlag(hdr, FLAG_COMPRESSED));
+    CHECK(!hasHeaderFlag(hdr, FLAG_BATCHED));
+
+    setHeaderFlag(hdr, FLAG_BATCHED);
+    CHECK(hasHeaderFlag(hdr, FLAG_COMPRESSED));
+    CHECK(hasHeaderFlag(hdr, FLAG_BATCHED));
+    CHECK(getHeaderStatus(hdr) == TaskStatus::Ok);
+
+    // Test with status code
+    MessageHeader errHdr{};
+    errHdr.status = _byteswap_ulong(static_cast<uint32_t>(TaskStatus::InvalidRequest));
+    CHECK(getHeaderStatus(errHdr) == TaskStatus::InvalidRequest);
+    setHeaderFlag(errHdr, FLAG_COMPRESSED);
+    CHECK(hasHeaderFlag(errHdr, FLAG_COMPRESSED));
+    CHECK(getHeaderStatus(errHdr) == TaskStatus::InvalidRequest);
+}
+
+static void test_adaptive_transfer_compressibility() {
+    // 1. Repeating pattern (highly compressible)
+    std::vector<std::byte> compressible(65536);
+    for (size_t i = 0; i < compressible.size(); ++i) {
+        compressible[i] = static_cast<std::byte>(0xAB);
+    }
+    float ratioC = AdaptiveTransferPolicy::estimateCompressibility(compressible);
+    CHECK(ratioC > 5.0f);
+
+    // 2. High-entropy pseudo-random pattern (incompressible)
+    std::vector<std::byte> incompressible(65536);
+    uint32_t state = 2463534242u;
+    for (size_t i = 0; i < incompressible.size(); ++i) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        incompressible[i] = static_cast<std::byte>(state & 0xFF);
+    }
+    float ratioI = AdaptiveTransferPolicy::estimateCompressibility(incompressible);
+    CHECK(ratioI <= 1.05f);
+}
+
+static void test_adaptive_transfer_evaluation_and_stats() {
+    AdaptiveTransferPolicy policy;
+
+    std::vector<std::byte> compressible(65536, static_cast<std::byte>(0x55));
+    std::vector<std::byte> incompressible(65536);
+    uint32_t state = 123456789u;
+    for (size_t i = 0; i < incompressible.size(); ++i) {
+        state = state * 1664525u + 1013904223u;
+        incompressible[i] = static_cast<std::byte>((state >> 16) & 0xFF);
+    }
+
+    // Low bandwidth link (1 MB/s = 8 Mbps): compression should be highly profitable for compressible data
+    auto evalC = policy.evaluate(compressible, 8'000'000);
+    CHECK(evalC.decision == CodecDecision::Compress);
+    CHECK(evalC.isProfitable);
+    CHECK(policy.shouldCompress(compressible, 8'000'000));
+
+    // Ultra-fast link (100 Gbps = 100,000,000,000 bps) + incompressible data: should bypass LZ4
+    auto evalI = policy.evaluate(incompressible, 100'000'000'000ull);
+    CHECK(evalI.decision == CodecDecision::BypassRaw);
+    CHECK(!evalI.isProfitable);
+    CHECK(!policy.shouldCompress(incompressible, 100'000'000'000ull));
+
+    // Force compression overrides
+    policy.setForceCompression(true);
+    CHECK(policy.shouldCompress(incompressible, 100'000'000'000ull));
+    policy.setForceCompression(false);
+    CHECK(!policy.shouldCompress(compressible, 8'000'000));
+    policy.setForceCompression(std::nullopt);
+
+    // Minimum payload threshold
+    policy.setMinPayloadBytes(100'000);
+    CHECK(!policy.shouldCompress(compressible, 8'000'000));
+    policy.setMinPayloadBytes(1024);
+
+    // Rolling statistics updates
+    policy.recordCompression(1'000'000, 250'000, 2000);
+    policy.recordDecompression(1'000'000, 250'000, 800);
+    auto st = policy.stats();
+    CHECK(st.totalBytesCompressed == 1'000'000);
+    CHECK(st.totalCompressionUs == 2000);
+    CHECK(st.totalDecompressionUs == 800);
+    CHECK(st.compressDecisions > 0);
+    CHECK(st.bypassDecisions > 0);
+}
+
+static void test_batched_payload_pack_unpack() {
+    std::vector<std::vector<std::byte>> items;
+    items.push_back({}); // 0-byte item
+    items.push_back({static_cast<std::byte>(1), static_cast<std::byte>(2), static_cast<std::byte>(3)});
+    std::vector<std::byte> largeItem(1024, static_cast<std::byte>(0x7F));
+    items.push_back(largeItem);
+
+    auto packed = BatchedPayload::pack(items);
+    CHECK(!packed.empty());
+
+    auto unpacked = BatchedPayload::unpack(packed);
+    CHECK(unpacked.size() == 3);
+    CHECK(unpacked[0].empty());
+    CHECK(unpacked[1].size() == 3);
+    CHECK(unpacked[1][0] == static_cast<std::byte>(1));
+    CHECK(unpacked[1][1] == static_cast<std::byte>(2));
+    CHECK(unpacked[1][2] == static_cast<std::byte>(3));
+    CHECK(unpacked[2] == largeItem);
+
+    // Empty roundtrip
+    auto emptyPacked = BatchedPayload::pack({});
+    auto emptyUnpacked = BatchedPayload::unpack(emptyPacked);
+    CHECK(emptyUnpacked.empty());
+
+    // Corrupt buffer detection
+    bool caught = false;
+    try {
+        std::vector<std::byte> corrupt = {static_cast<std::byte>(1)};
+        (void)BatchedPayload::unpack(corrupt);
+    } catch (const std::exception&) {
+        caught = true;
+    }
+    CHECK(caught);
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 int main() {
@@ -365,6 +495,10 @@ int main() {
     test_workerCapabilities_supportsTask();
     test_hello_v2_capabilities_roundtrip();
     test_hello_v1_backward_compatibility();
+    test_header_flags();
+    test_adaptive_transfer_compressibility();
+    test_adaptive_transfer_evaluation_and_stats();
+    test_batched_payload_pack_unpack();
 
     std::cout << g_passed << " passed, " << g_failed << " failed.\n";
     return g_failed == 0 ? 0 : 1;

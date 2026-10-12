@@ -452,6 +452,131 @@ static void test_health_monitor_state_transitions() {
     std::cout << "  health-monitor state transitions & auto-recovery: PASS\n";
 }
 
+// ─── Test: Adaptive compression and transfer policy with TaskClient ───────────
+
+static void test_adaptive_transfer_policy_client() {
+    WinsockInit wsa;
+    CHECK(wsa.ok());
+
+    TaskServer server;
+    CHECK(server.start(17784, [](TcpConnection conn) {
+        Message hello;
+        if (!conn.receiveMessage(hello)) return;
+        auto ack = Message::makeHelloAck("WorkerAdaptive", "RTX 3050", 4096);
+        if (!conn.sendMessage(ack)) return;
+
+        Message msg;
+        while (conn.receiveMessage(msg)) {
+            uint16_t msgType = 0;
+            std::memcpy(&msgType, &msg.header.messageType, sizeof(msgType));
+            msgType = _byteswap_ushort(msgType);
+
+            if (msgType == static_cast<uint16_t>(MessageType::Ping)) {
+                uint64_t tid = 0;
+                std::memcpy(&tid, &msg.header.taskId, sizeof(tid));
+                auto pong = Message::makePong(_byteswap_uint64(tid));
+                conn.sendMessage(pong);
+                continue;
+            }
+
+            bool isCompressed = (msgType == static_cast<uint16_t>(MessageType::SubmitTaskCompressed)) ||
+                                hasHeaderFlag(msg.header, FLAG_COMPRESSED);
+
+            TaskRequest req;
+            if (isCompressed) {
+                uint32_t uncompSize = 0;
+                std::memcpy(&uncompSize, msg.payload.data(), 4);
+                auto decomp = decompressBuffer(
+                    std::span<const std::byte>(msg.payload.data() + 4, msg.payload.size() - 4),
+                    uncompSize);
+                req = TaskRequest::deserialise(decomp);
+            } else {
+                req = TaskRequest::deserialise(msg.payload);
+            }
+
+            TaskResult res;
+            res.taskId = req.taskId;
+            res.status = TaskStatus::Ok;
+            res.output = req.input; // Echo back same buffer
+
+            Message resp;
+            auto pl = res.serialise();
+            if (isCompressed) {
+                pl = compressBuffer(pl);
+                resp.header.messageType = _byteswap_ushort(static_cast<uint16_t>(MessageType::TaskResultCompressed));
+                setHeaderFlag(resp.header, FLAG_COMPRESSED);
+            } else {
+                resp.header.messageType = _byteswap_ushort(static_cast<uint16_t>(MessageType::TaskResult));
+            }
+            resp.header.magic       = _byteswap_ulong(MAGIC);
+            resp.header.version     = _byteswap_ushort(PROTO_VERSION);
+            resp.header.taskId      = _byteswap_uint64(req.taskId);
+            resp.header.payloadSize = _byteswap_ulong(static_cast<uint32_t>(pl.size()));
+            resp.payload            = std::move(pl);
+            conn.sendMessage(resp);
+        }
+    }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    TaskClient client;
+    CHECK(client.connect("127.0.0.1", 17784));
+
+    // Case 1: Compressible payload + 10 Mbps bandwidth -> should compress
+    {
+        client.setLinkBandwidthBps(10'000'000); // 10 Mbps
+        TaskRequest req;
+        req.taskId = 501;
+        req.type   = TaskType::Blur;
+        req.width  = 128;
+        req.height = 128;
+        req.input.resize(128 * 128 * 4, static_cast<std::byte>(0x3C));
+
+        auto res = client.submit(req);
+        CHECK(res.status == TaskStatus::Ok);
+        CHECK(res.taskId == 501);
+
+        auto tm = client.lastTransferMetrics();
+        CHECK(tm.wasCompressed);
+        CHECK(tm.compressedSendBytes < tm.uncompressedSendBytes);
+        CHECK(tm.compressionRatioSend > 2.0f);
+    }
+
+    // Case 2: High-entropy payload + 10 Gbps bandwidth -> should bypass compression
+    {
+        client.setLinkBandwidthBps(10'000'000'000ull); // 10 Gbps
+        TaskRequest req;
+        req.taskId = 502;
+        req.type   = TaskType::Blur;
+        req.width  = 128;
+        req.height = 128;
+        req.input.resize(128 * 128 * 4);
+        uint32_t state = 987654321u;
+        for (size_t i = 0; i < req.input.size(); ++i) {
+            state = state * 1664525u + 1013904223u;
+            req.input[i] = static_cast<std::byte>((state >> 16) & 0xFF);
+        }
+
+        auto res = client.submit(req);
+        CHECK(res.status == TaskStatus::Ok);
+        CHECK(res.taskId == 502);
+
+        auto tm = client.lastTransferMetrics();
+        CHECK(!tm.wasCompressed);
+        CHECK(tm.compressedSendBytes == tm.uncompressedSendBytes);
+        CHECK(tm.compressionRatioSend == 1.0f);
+    }
+
+    // Verify stats tracked both compress and bypass decisions
+    auto stats = client.transferPolicy().stats();
+    CHECK(stats.compressDecisions >= 1);
+    CHECK(stats.bypassDecisions >= 1);
+    CHECK(stats.totalBytesEvaluated > 0);
+
+    client.disconnect();
+    server.stop();
+    std::cout << "  adaptive transfer policy client: PASS\n";
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 int main() {
@@ -463,6 +588,7 @@ int main() {
     test_large_payload();
     test_worker_capabilities_negotiation();
     test_health_monitor_state_transitions();
+    test_adaptive_transfer_policy_client();
     std::cout << g_passed << " passed, " << g_failed << " failed.\n";
     return g_failed == 0 ? 0 : 1;
 }

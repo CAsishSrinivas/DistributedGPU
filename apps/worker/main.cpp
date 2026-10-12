@@ -147,7 +147,8 @@ static void handleConnection(dgpu::networking::TcpConnection conn,
         }
 
         if (type == MessageType::SubmitTask || type == MessageType::SubmitTaskCompressed) {
-            bool isCompressed = (type == MessageType::SubmitTaskCompressed);
+            bool isCompressed = (type == MessageType::SubmitTaskCompressed) ||
+                                dgpu::protocol::hasHeaderFlag(msg.header, dgpu::protocol::FLAG_COMPRESSED);
             // Deserialise and validate
             TaskRequest req;
             try {
@@ -249,6 +250,9 @@ static void handleConnection(dgpu::networking::TcpConnection conn,
             resp.header.taskId      = _byteswap_uint64(result.taskId);
             resp.header.payloadSize = _byteswap_ulong(static_cast<uint32_t>(pl.size()));
             resp.header.status      = _byteswap_ulong(static_cast<uint32_t>(result.status));
+            if (returnCompressed) {
+                dgpu::protocol::setHeaderFlag(resp.header, dgpu::protocol::FLAG_COMPRESSED);
+            }
             resp.payload            = std::move(pl);
             conn.sendMessage(resp);
             continue;
