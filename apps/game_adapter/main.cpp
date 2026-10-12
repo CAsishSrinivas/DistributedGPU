@@ -112,10 +112,11 @@ int main(int argc, char* argv[]) {
     }
 
     dgpu::game_adapter::FramePacer baselinePacer;
+    dgpu::game_adapter::FramePacer bypassPacer;
     dgpu::game_adapter::FramePacer offloadPacer;
 
-    // ── Phase 1: Unmodified Game Baseline (All local execution) ───────────────
-    std::cout << "\n[1/3] Running Unmodified Game Baseline (" << BENCHMARK_FRAMES << " frames)...\n";
+    // ── Phase 1: Unmodified Game Baseline (Native Local Execution) ────────────
+    std::cout << "\n[1/4] Running Unmodified Game Baseline (" << BENCHMARK_FRAMES << " frames)...\n";
     for (uint32_t f = 0; f < BENCHMARK_FRAMES; ++f) {
         auto tStart = std::chrono::steady_clock::now();
 
@@ -144,8 +145,28 @@ int main(int argc, char* argv[]) {
     }
     auto baseStats = baselinePacer.computeStats();
 
-    // ── Phase 2: M7 Distributed GPU Offload (True Pipelined Execution) ────────
-    std::cout << "[2/3] Running Distributed Cooperative Offload (" << BENCHMARK_FRAMES << " frames)...\n";
+    // ── Phase 2: Hook Bypass Mode (Zero-Overhead Verification) ─────────────────
+    std::cout << "[2/4] Running Hook Bypass Mode (" << BENCHMARK_FRAMES << " frames)...\n";
+    adapter.setBypass(true);
+    for (uint32_t f = 0; f < BENCHMARK_FRAMES; ++f) {
+        auto tStart = std::chrono::steady_clock::now();
+
+        auto frameBuf = renderGameScene(GAME_WIDTH, GAME_HEIGHT, f);
+        auto interBuf = renderGameScene(OFFLOAD_WIDTH, OFFLOAD_HEIGHT, f);
+
+        // In bypass mode, submit and composite return immediately with no network or GPU overhead
+        (void)adapter.submitPostProcess(interBuf, OFFLOAD_WIDTH, OFFLOAD_HEIGHT, scheduler);
+        (void)adapter.syncAndComposite(frameBuf, GAME_WIDTH, GAME_HEIGHT, compositor);
+
+        auto tEnd = std::chrono::steady_clock::now();
+        uint64_t frameUs = std::chrono::duration_cast<std::chrono::microseconds>(tEnd - tStart).count();
+        bypassPacer.recordFrame(frameUs);
+    }
+    auto bypassStats = bypassPacer.computeStats();
+    adapter.setBypass(false);
+
+    // ── Phase 3: M7 Distributed GPU Offload (True Pipelined Execution) ────────
+    std::cout << "[3/4] Running Distributed Cooperative Offload (" << BENCHMARK_FRAMES << " frames)...\n";
 
     // Seed pipeline with frame 0
     auto prevFrameBuf = renderGameScene(GAME_WIDTH, GAME_HEIGHT, 0);
@@ -181,8 +202,8 @@ int main(int argc, char* argv[]) {
     }
     auto offloadStats = offloadPacer.computeStats();
 
-    // ── Phase 3: Worker Disconnect & Circuit Breaker Recovery ─────────────────
-    std::cout << "[3/3] Testing Worker Disconnect & Recovery (trip circuit breaker)...\n";
+    // ── Phase 4: Worker Disconnect & Circuit Breaker Recovery ─────────────────
+    std::cout << "[4/4] Testing Worker Disconnect & Recovery (trip circuit breaker)...\n";
     scheduler.recordRemoteFailure();
     scheduler.recordRemoteFailure();
     scheduler.recordRemoteFailure(); // Trip breaker
@@ -205,6 +226,8 @@ int main(int argc, char* argv[]) {
     std::cout << "╠══════════════════════════════════════════════════════════════════════╣\n";
     std::cout << std::format("║ Unmodified Baseline:  Avg FPS: {:>5.1f} | 1% Low: {:>5.1f} | Stutter: {:>4.1f}% ║\n",
                              baseStats.avgFps, baseStats.onePercentLow, baseStats.stutterPct);
+    std::cout << std::format("║ Hook Bypass Mode:     Avg FPS: {:>5.1f} | 1% Low: {:>5.1f} | Stutter: {:>4.1f}% ║\n",
+                             bypassStats.avgFps, bypassStats.onePercentLow, bypassStats.stutterPct);
     std::cout << std::format("║ Distributed Offload:  Avg FPS: {:>5.1f} | 1% Low: {:>5.1f} | Stutter: {:>4.1f}% ║\n",
                              offloadStats.avgFps, offloadStats.onePercentLow, offloadStats.stutterPct);
 

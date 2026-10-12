@@ -4,6 +4,7 @@
 #include "d3d12_game_hook.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <numeric>
@@ -56,16 +57,23 @@ FramePacingStats FramePacer::computeStats() const {
 // ─── GameOffloadAdapter Implementation ────────────────────────────────────────
 
 struct GameOffloadAdapter::Impl {
+    static constexpr size_t kRingSize = 3;
+
     uint32_t width{};
     uint32_t height{};
     uint64_t currentTaskId = 7000;
 
-    d3d12::GpuBuffer        readbackStaging;
-    ID3D12Device5*          device{nullptr};
+    std::array<d3d12::GpuBuffer, kRingSize> readbackRing;
+    size_t ringWriteIdx = 0;
+    size_t ringReadIdx = 0;
+    size_t ringCount = 0;
+
+    ID3D12Device5* device{nullptr};
 
     task_runtime::JobHandle activeJob;
     bool hasActiveJob = false;
     bool lastWasRemote = false;
+    bool bypass = false;
 };
 
 GameOffloadAdapter::GameOffloadAdapter()  : m_impl(std::make_unique<Impl>()) {}
@@ -75,12 +83,17 @@ bool GameOffloadAdapter::init(ID3D12Device5* device, uint32_t width, uint32_t he
     m_impl->width  = width;
     m_impl->height = height;
     m_impl->device = device;
+    m_impl->ringWriteIdx = 0;
+    m_impl->ringReadIdx = 0;
+    m_impl->ringCount = 0;
 
-    if (device) {
+    if (device && width > 0 && height > 0) {
         const uint64_t sz = static_cast<uint64_t>(width) * height * 4;
-        if (!m_impl->readbackStaging.create(device, sz, d3d12::BufferUsage::Readback)) {
-            std::cerr << "[GameOffloadAdapter] Failed to allocate D3D12 readback staging buffer\n";
-            return false;
+        for (size_t i = 0; i < Impl::kRingSize; ++i) {
+            if (!m_impl->readbackRing[i].create(device, sz, d3d12::BufferUsage::Readback)) {
+                std::cerr << "[GameOffloadAdapter] Failed to allocate D3D12 readback staging buffer " << i << '\n';
+                return false;
+            }
         }
     }
     return true;
@@ -89,22 +102,46 @@ bool GameOffloadAdapter::init(ID3D12Device5* device, uint32_t width, uint32_t he
 bool GameOffloadAdapter::captureD3D12Texture(ID3D12GraphicsCommandList* cl,
                                             ID3D12Resource*             sourceResource,
                                             std::vector<std::byte>&     outPixels) {
-    if (!cl || !sourceResource || !m_impl->readbackStaging.resource()) {
+    if (m_impl->bypass || !cl || !sourceResource) {
         return false;
     }
 
-    // Copy source GPU render target resource into CPU-readable readback staging buffer
-    cl->CopyResource(m_impl->readbackStaging.resource(), sourceResource);
-    return m_impl->readbackStaging.readback(outPixels);
+    auto& writeBuf = m_impl->readbackRing[m_impl->ringWriteIdx];
+    if (!writeBuf.resource()) {
+        return false;
+    }
+
+    // Schedule asynchronous copy into current write staging slot
+    cl->CopyResource(writeBuf.resource(), sourceResource);
+
+    // Decoupled asynchronous readback: extract data from earlier completed frame in the ring
+    bool readSuccess = false;
+    if (m_impl->ringCount > 0) {
+        auto& readBuf = m_impl->readbackRing[m_impl->ringReadIdx];
+        if (readBuf.resource()) {
+            readSuccess = readBuf.readback(outPixels);
+            m_impl->ringReadIdx = (m_impl->ringReadIdx + 1) % Impl::kRingSize;
+        }
+    }
+
+    m_impl->ringWriteIdx = (m_impl->ringWriteIdx + 1) % Impl::kRingSize;
+    if (m_impl->ringCount < Impl::kRingSize) {
+        ++m_impl->ringCount;
+    }
+
+    return readSuccess;
 }
 
 bool GameOffloadAdapter::submitPostProcess(const std::vector<std::byte>& intermediateFrame,
                                           uint32_t width,
                                           uint32_t height,
                                           host::JobScheduler& scheduler) {
+    if (m_impl->bypass) return true;
+    if (intermediateFrame.empty()) return false;
+
     protocol::TaskRequest req;
     req.taskId = m_impl->currentTaskId++;
-    req.type   = protocol::TaskType::Blur; // SOTTR Depth of Field / Bloom pass
+    req.type   = protocol::TaskType::Blur; // Post-processing pass
     req.width  = width;
     req.height = height;
     req.input  = intermediateFrame;
@@ -120,9 +157,15 @@ bool GameOffloadAdapter::syncAndComposite(std::vector<std::byte>& backbuffer,
                                           uint32_t width,
                                           uint32_t height,
                                           host::FrameCompositor& compositor) {
+    if (m_impl->bypass) return true;
     if (!m_impl->hasActiveJob) return false;
 
-    // Await completed result at Present synchronization point
+    // Non-blocking poll at Present synchronization point: NEVER stall the render thread!
+    if (m_impl->activeJob.future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+        // Result not ready before Present; proceed with native rendering without stalling
+        return false;
+    }
+
     auto result = m_impl->activeJob.future.get();
     m_impl->hasActiveJob = false;
 
@@ -160,6 +203,14 @@ bool GameOffloadAdapter::syncAndComposite(std::vector<std::byte>& backbuffer,
 
 bool GameOffloadAdapter::lastFrameWasRemote() const noexcept {
     return m_impl->lastWasRemote;
+}
+
+void GameOffloadAdapter::setBypass(bool bypass) noexcept {
+    m_impl->bypass = bypass;
+}
+
+bool GameOffloadAdapter::isBypass() const noexcept {
+    return m_impl->bypass;
 }
 
 } // namespace dgpu::game_adapter
