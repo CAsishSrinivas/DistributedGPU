@@ -1,8 +1,12 @@
 // d3d12/d3d12_context.cpp
 // DirectX 12 device initialisation, buffer management, compute pipeline, and timers.
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>

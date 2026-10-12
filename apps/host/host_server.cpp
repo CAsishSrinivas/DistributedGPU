@@ -2,8 +2,12 @@
 // Manages the host-side server that listens for incoming worker connections
 // and coordinates task submission across the distributed runtime.
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 
 #include "host_server.hpp"

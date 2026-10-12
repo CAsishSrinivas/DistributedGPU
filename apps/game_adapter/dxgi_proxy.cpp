@@ -3,8 +3,12 @@
 // Compiles to dxgi.dll. When placed in the game executable's root folder,
 // Windows loads this DLL before System32\dxgi.dll.
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <dxgi1_6.h>
 #include <d3d12.h>
@@ -521,7 +525,7 @@ void initDistributedHook(IDXGISwapChain* swapChain) {
     g_scheduler.setRemoteExecutor([](const dgpu::protocol::TaskRequest& req) {
         if (!g_workerClient.isConnected()) {
             auto ep = resolveEndpointConfig();
-            g_workerClient.connect(ep);
+            (void)g_workerClient.connect(ep);
         }
         return g_workerClient.submit(req);
     });
@@ -536,7 +540,7 @@ void initDistributedHook(IDXGISwapChain* swapChain) {
 
     uint32_t offloadW = desc.BufferDesc.Width  > 0 ? desc.BufferDesc.Width / 2  : 960;
     uint32_t offloadH = desc.BufferDesc.Height > 0 ? desc.BufferDesc.Height / 2 : 540;
-    g_adapter.init(nullptr, offloadW, offloadH);
+    (void)g_adapter.init(nullptr, offloadW, offloadH);
 
     g_hookInitialized = true;
     logMsg("[dgpu_dxgi] Distributed GPU pipeline initialized on SwapChain.");

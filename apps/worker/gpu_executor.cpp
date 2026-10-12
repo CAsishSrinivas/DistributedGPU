@@ -7,8 +7,12 @@
 // concerns (e.g. VRAM pressure checks, per-task telemetry hooks) without
 // touching the shared library.
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 
 #include "worker_gpu_executor.hpp"
