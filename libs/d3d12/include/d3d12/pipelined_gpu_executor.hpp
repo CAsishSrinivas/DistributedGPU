@@ -5,6 +5,7 @@
 #pragma once
 
 #include "d3d12/d3d12_context.hpp"
+#include "d3d12/resource_pool.hpp"
 #include "protocol/message.hpp"
 
 #include <cstdint>
@@ -61,6 +62,11 @@ public:
 
     [[nodiscard]] uint32_t slotCount() const noexcept;
     [[nodiscard]] const d3d12::AdapterInfo& adapterInfo() const noexcept;
+
+    // Phase 2.4: D3D12 Resource Pool & Memory Bounds Metrics
+    [[nodiscard]] d3d12::ResourcePoolMetrics resourcePoolMetrics() const noexcept;
+    [[nodiscard]] uint64_t activeVramBytes() const noexcept;
+    void resetPoolMetrics() noexcept;
 
 private:
     struct Impl;

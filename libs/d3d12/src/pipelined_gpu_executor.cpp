@@ -1,5 +1,5 @@
 // libs/d3d12/src/pipelined_gpu_executor.cpp
-// Multi-buffered / double-buffered D3D12 GPU compute executor (Phase 2.3).
+// Multi-buffered / double-buffered D3D12 GPU compute executor with Resource Pooling (Phase 2.3 / 2.4).
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -13,6 +13,7 @@
 
 #include "d3d12/pipelined_gpu_executor.hpp"
 #include "d3d12/d3d12_context.hpp"
+#include "d3d12/resource_pool.hpp"
 #include "shader_sources.hpp"
 #include "telemetry/telemetry.hpp"
 
@@ -46,17 +47,16 @@ static void transitionResource(ID3D12GraphicsCommandList* cl,
 // ─── Slot: Dedicated resources for one stage of the pipeline ─────────────────
 
 struct PipelineSlot {
-    d3d12::GpuBuffer upload;
-    d3d12::GpuBuffer gpuInput;
-    d3d12::GpuBuffer gpuOutput;
-    d3d12::GpuBuffer readback;
+    d3d12::PooledGpuBuffer* upload{nullptr};
+    d3d12::PooledGpuBuffer* gpuInput{nullptr};
+    d3d12::PooledGpuBuffer* gpuOutput{nullptr};
+    d3d12::PooledGpuBuffer* readback{nullptr};
 
     ComPtr<ID3D12CommandAllocator>     cmdAlloc;
     ComPtr<ID3D12GraphicsCommandList4> cmdList;
 
     uint32_t width{0};
     uint32_t height{0};
-    bool     valid{false};
     bool     inFlight{false};
 
     D3D12_RESOURCE_STATES gpuInputState{D3D12_RESOURCE_STATE_COMMON};
@@ -67,34 +67,13 @@ struct PipelineSlot {
     uint64_t uploadUs{0};
     std::chrono::steady_clock::time_point submitTime;
     std::chrono::steady_clock::time_point uploadStartTime;
-
-    bool ensureBuffers(ID3D12Device5* device, uint32_t w, uint32_t h) {
-        if (valid && width == w && height == h) return true;
-
-        const uint64_t sz = static_cast<uint64_t>(w) * h * 4;
-        upload    = {};
-        gpuInput  = {};
-        gpuOutput = {};
-        readback  = {};
-
-        if (!upload.create(device, sz, d3d12::BufferUsage::Upload))   return false;
-        if (!gpuInput.create(device, sz, d3d12::BufferUsage::Default)) return false;
-        if (!gpuOutput.create(device, sz, d3d12::BufferUsage::Default))return false;
-        if (!readback.create(device, sz, d3d12::BufferUsage::Readback))return false;
-
-        width  = w;
-        height = h;
-        valid  = true;
-        gpuInputState  = D3D12_RESOURCE_STATE_COMMON;
-        gpuOutputState = D3D12_RESOURCE_STATE_COMMON;
-        return true;
-    }
 };
 
 // ─── PipelinedGpuExecutor::Impl ──────────────────────────────────────────────
 
 struct PipelinedGpuExecutor::Impl {
     d3d12::D3D12Context                                   ctx;
+    d3d12::D3D12ResourcePool                              resourcePool;
     std::unordered_map<uint32_t, d3d12::ComputePipeline> pipelines;
     std::vector<PipelineSlot>                             slots;
     uint32_t                                              slotCount{2};
@@ -183,8 +162,21 @@ bool PipelinedGpuExecutor::submitAsync(const protocol::TaskRequest& req, uint32_
     if (it == m_impl->pipelines.end()) return false;
 
     slot.uploadStartTime = std::chrono::steady_clock::now();
-    if (!slot.ensureBuffers(m_impl->ctx.device(), req.width, req.height)) return false;
-    if (!slot.upload.upload(req.input)) return false;
+    const uint64_t sz = static_cast<uint64_t>(req.width) * req.height * 4;
+    const uint64_t completedFence = m_impl->fence->GetCompletedValue();
+
+    // Acquire buffers from fence-synchronized resource pool (Phase 2.4)
+    slot.upload    = m_impl->resourcePool.acquireBuffer(m_impl->ctx.device(), sz, d3d12::BufferUsage::Upload, completedFence);
+    slot.gpuInput  = m_impl->resourcePool.acquireBuffer(m_impl->ctx.device(), sz, d3d12::BufferUsage::Default, completedFence);
+    slot.gpuOutput = m_impl->resourcePool.acquireBuffer(m_impl->ctx.device(), sz, d3d12::BufferUsage::Default, completedFence);
+    slot.readback  = m_impl->resourcePool.acquireBuffer(m_impl->ctx.device(), sz, d3d12::BufferUsage::Readback, completedFence);
+
+    if (!slot.upload || !slot.gpuInput || !slot.gpuOutput || !slot.readback) {
+        std::cerr << "[PipelinedGpuExecutor] Failed to acquire pooled buffers for task " << req.taskId << '\n';
+        return false;
+    }
+
+    if (!slot.upload->buffer.upload(req.input)) return false;
 
     auto uploadEndTime = std::chrono::steady_clock::now();
     slot.uploadUs = static_cast<uint64_t>(
@@ -195,26 +187,28 @@ bool PipelinedGpuExecutor::submitAsync(const protocol::TaskRequest& req, uint32_
     if (FAILED(slot.cmdList->Reset(slot.cmdAlloc.Get(), nullptr))) return false;
 
     auto* cl = slot.cmdList.Get();
+    slot.gpuInputState  = D3D12_RESOURCE_STATE_COMMON;
+    slot.gpuOutputState = D3D12_RESOURCE_STATE_COMMON;
 
     // 1. Copy from upload heap to default GPU input buffer
-    transitionResource(cl, slot.gpuInput.resource(),
+    transitionResource(cl, slot.gpuInput->buffer.resource(),
                        slot.gpuInputState,
                        D3D12_RESOURCE_STATE_COPY_DEST);
-    cl->CopyResource(slot.gpuInput.resource(), slot.upload.resource());
+    cl->CopyResource(slot.gpuInput->buffer.resource(), slot.upload->buffer.resource());
 
     // 2. Transition resources for compute dispatch
-    transitionResource(cl, slot.gpuInput.resource(),
+    transitionResource(cl, slot.gpuInput->buffer.resource(),
                        slot.gpuInputState,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    transitionResource(cl, slot.gpuOutput.resource(),
+    transitionResource(cl, slot.gpuOutput->buffer.resource(),
                        slot.gpuOutputState,
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     // 3. Bind compute pipeline and root descriptors
     auto& pso = it->second;
     pso.bind(cl);
-    pso.setRootUAV(cl, slot.gpuOutput.resource()->GetGPUVirtualAddress(), 0);
-    pso.setRootSRV(cl, slot.gpuInput.resource()->GetGPUVirtualAddress(), 1);
+    pso.setRootUAV(cl, slot.gpuOutput->buffer.resource()->GetGPUVirtualAddress(), 0);
+    pso.setRootSRV(cl, slot.gpuInput->buffer.resource()->GetGPUVirtualAddress(), 1);
 
     static uint32_t s_radius = 0;
     static uint32_t s_iterations = 0;
@@ -244,16 +238,16 @@ bool PipelinedGpuExecutor::submitAsync(const protocol::TaskRequest& req, uint32_
     cl->Dispatch(gx, gy, 1);
 
     // 5. Transition output to COPY_SOURCE and copy to readback buffer
-    transitionResource(cl, slot.gpuOutput.resource(),
+    transitionResource(cl, slot.gpuOutput->buffer.resource(),
                        slot.gpuOutputState,
                        D3D12_RESOURCE_STATE_COPY_SOURCE);
-    cl->CopyResource(slot.readback.resource(), slot.gpuOutput.resource());
+    cl->CopyResource(slot.readback->buffer.resource(), slot.gpuOutput->buffer.resource());
 
     // 6. Restore GPU resources to COMMON
-    transitionResource(cl, slot.gpuInput.resource(),
+    transitionResource(cl, slot.gpuInput->buffer.resource(),
                        slot.gpuInputState,
                        D3D12_RESOURCE_STATE_COMMON);
-    transitionResource(cl, slot.gpuOutput.resource(),
+    transitionResource(cl, slot.gpuOutput->buffer.resource(),
                        slot.gpuOutputState,
                        D3D12_RESOURCE_STATE_COMMON);
 
@@ -272,6 +266,8 @@ bool PipelinedGpuExecutor::submitAsync(const protocol::TaskRequest& req, uint32_
     slot.fenceValue    = m_impl->nextFenceValue;
     slot.inFlight      = true;
     slot.currentTaskId = req.taskId;
+    slot.width         = req.width;
+    slot.height        = req.height;
     slot.submitTime    = std::chrono::steady_clock::now();
 
     return true;
@@ -308,9 +304,13 @@ protocol::TaskResult PipelinedGpuExecutor::collect(uint32_t slotIndex) {
 
     // Read back results into host CPU memory
     auto rbStart = std::chrono::steady_clock::now();
-    if (!slot.readback.readback(res.output)) {
+    if (!slot.readback->buffer.readback(res.output)) {
         res.status = protocol::TaskStatus::GpuError;
         return res;
+    }
+    const size_t expectedOutputBytes = static_cast<size_t>(slot.width) * slot.height * 4;
+    if (res.output.size() > expectedOutputBytes) {
+        res.output.resize(expectedOutputBytes);
     }
     auto rbEnd = std::chrono::steady_clock::now();
     res.readbackUs = static_cast<uint64_t>(
@@ -320,7 +320,17 @@ protocol::TaskResult PipelinedGpuExecutor::collect(uint32_t slotIndex) {
     res.totalUs  = res.uploadUs + res.gpuUs + res.readbackUs;
     res.status   = protocol::TaskStatus::Ok;
 
-    slot.inFlight = false;
+    // Release pooled buffers back to resource pool with this slot's completion fence value (Phase 2.4)
+    m_impl->resourcePool.releaseBuffer(slot.upload, slot.fenceValue);
+    m_impl->resourcePool.releaseBuffer(slot.gpuInput, slot.fenceValue);
+    m_impl->resourcePool.releaseBuffer(slot.gpuOutput, slot.fenceValue);
+    m_impl->resourcePool.releaseBuffer(slot.readback, slot.fenceValue);
+    slot.upload    = nullptr;
+    slot.gpuInput  = nullptr;
+    slot.gpuOutput = nullptr;
+    slot.readback  = nullptr;
+    slot.inFlight  = false;
+
     return res;
 }
 
@@ -408,6 +418,18 @@ uint32_t PipelinedGpuExecutor::slotCount() const noexcept {
 
 const d3d12::AdapterInfo& PipelinedGpuExecutor::adapterInfo() const noexcept {
     return m_impl->ctx.adapterInfo();
+}
+
+d3d12::ResourcePoolMetrics PipelinedGpuExecutor::resourcePoolMetrics() const noexcept {
+    return m_impl ? m_impl->resourcePool.metrics() : d3d12::ResourcePoolMetrics{};
+}
+
+uint64_t PipelinedGpuExecutor::activeVramBytes() const noexcept {
+    return m_impl ? m_impl->resourcePool.activeVramBytes() : 0;
+}
+
+void PipelinedGpuExecutor::resetPoolMetrics() noexcept {
+    if (m_impl) m_impl->resourcePool.resetMetrics();
 }
 
 } // namespace dgpu::gpu_executor

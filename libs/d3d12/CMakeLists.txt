@@ -2,6 +2,7 @@ add_library(dgpu_d3d12 STATIC
     src/d3d12_context.cpp
     src/gpu_executor.cpp
     src/pipelined_gpu_executor.cpp
+    src/resource_pool.cpp
 )
 target_include_directories(dgpu_d3d12 PUBLIC include)
 target_link_libraries(dgpu_d3d12
