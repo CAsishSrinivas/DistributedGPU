@@ -71,3 +71,15 @@ target_link_libraries(test_pipeline_transfers PRIVATE
 )
 add_test(NAME pipeline_transfers_tests COMMAND test_pipeline_transfers)
 
+add_executable(test_resource_pool
+    test_resource_pool.cpp
+    ../../apps/host/frame_compositor.cpp
+)
+target_include_directories(test_resource_pool PRIVATE ../../apps/host ../.. ../../libs)
+target_link_libraries(test_resource_pool PRIVATE
+    dgpu_compile_options
+    dgpu_protocol
+    dgpu_telemetry
+    $<$<BOOL:${D3D12_AVAILABLE}>:dgpu_d3d12>
+)
+add_test(NAME resource_pool_tests COMMAND test_resource_pool)
